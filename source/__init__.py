@@ -6,4 +6,4 @@ __version__ = "3.0.0"
 from .config import Config
 from . import propagator
 from .optical_mul import OpticalMul
-from .parallel import DataParallel
+from .parallel import DataParallel, OpticalDataParallel
