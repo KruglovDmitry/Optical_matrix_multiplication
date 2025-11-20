@@ -320,6 +320,8 @@ class Config(ConfigOpticBase, ConfigModelBase):
         self._input_vector_split_x: int = left_matrix_split_x
         self._input_vector_split_y: int = left_matrix_split_y
         self._result_vector_split: int = result_matrix_split
+        self._right_matrix_count_columns: int = right_matrix_count_columns
+        self._right_matrix_count_rows: int = right_matrix_count_rows
 
     @property
     def matrix_split_x(self) -> int:
@@ -356,6 +358,22 @@ class Config(ConfigOpticBase, ConfigModelBase):
             Информация о разбиении пикселей элементов выходного вектора по оси Y.
         """
         return self._result_vector_split
+
+    @property
+    def right_matrix_count_columns(self) -> int:
+        """
+        Returns:
+            Число столбцов в правой матрице.
+        """
+        return self._right_matrix_count_columns
+
+    @property
+    def right_matrix_count_rows(self) -> int:
+        """
+        Returns:
+            Число строк в правой матрице.
+        """
+        return self._right_matrix_count_rows
 
     def save(self, filename: str = "config.pth"):
         """

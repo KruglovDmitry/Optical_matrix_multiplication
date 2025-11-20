@@ -33,6 +33,18 @@ class OpticalMul(_nn.Module):
         self.register_buffer('_kron_mat_utils', kron_mat_utils, persistent=True)
         
         self._avg_pool = _nn.AvgPool2d((1, config.result_vector_split))
+        
+        # Адаптивные коэффициенты масштабирования для оптической системы
+        self.input_scale = _nn.Parameter(_torch.ones(1), requires_grad=True)
+        self.matrix_scale = _nn.Parameter(_torch.ones(1), requires_grad=True)
+        self.output_scale = _nn.Parameter(_torch.ones(1), requires_grad=True)
+        
+        # Обучаемые нелинейные преобразования (используем модуль для комплексных чисел)
+        self.nonlinear_gate = _nn.Parameter(_torch.ones(1), requires_grad=True)
+        
+        # Адаптивная диагональная матрица (переименуем и активируем)
+        # Используем right_matrix_count_columns из конфигурации
+        self.diagonal_matrix = _nn.Parameter(_torch.ones(config.right_matrix_count_columns), requires_grad=True)
 
     def prepare_vector(self, data: _torch.Tensor) -> _torch.Tensor:
         """
@@ -107,10 +119,28 @@ class OpticalMul(_nn.Module):
             >>> mul(A, B).shape
             torch.Size([1, 1, 64, 128])
         """
-        vec_field = self.prepare_vector(input)
-        mat_field = self.prepare_matrix(other)
+        # Применяем адаптивное масштабирование ко входным данным
+        input_scaled = input * self.input_scale
+        
+        vec_field = self.prepare_vector(input_scaled)
+        
+        # Применяем адаптивную диагональную матрицу к other
+        other_scaled = other * self.matrix_scale
+        other_scaled = other_scaled * self.diagonal_matrix.unsqueeze(0).unsqueeze(0).unsqueeze(0)
+        
+        mat_field = self.prepare_matrix(other_scaled)
 
         vec_field = self._propagator_one(vec_field)
+        
+        # Применяем нелинейное преобразование к модулю (для комплексных чисел)
+        vec_field_magnitude = vec_field.abs()
+        vec_field_phase = vec_field.angle()
+        vec_field_magnitude = _torch.sigmoid(vec_field_magnitude * self.nonlinear_gate)
+        vec_field = vec_field_magnitude * _torch.exp(1j * vec_field_phase)
+        
         vec_field = self._propagator_two(vec_field * mat_field)
+        
+        # Применяем выходное масштабирование
+        output = self.prepare_out(vec_field) * self.output_scale
 
-        return self.prepare_out(vec_field)
+        return output

@@ -145,6 +145,18 @@ class PropagatorCrossLens(PropagatorLens):
         operator_Y = _torch.exp(-1j * config.K / 2 / config.distance * plane.linspace_by_y**2)
         super(PropagatorCrossLens, self).__init__(_torch.diag_embed(operator_X),
                                                   _torch.diag_embed(operator_Y))
+        
+        # Обучаемые параметры для фазы модуляции
+        self.phase_mod_x = _nn.Parameter(_torch.zeros_like(plane.linspace_by_x), requires_grad=True)
+        self.phase_mod_y = _nn.Parameter(_torch.zeros_like(plane.linspace_by_y), requires_grad=True)
+
+    def forward(self, field: _torch.Tensor) -> _torch.Tensor:
+        """
+        Метод распространения светового поля через скрещенную линзу с обучаемой модуляцией фазы.
+        """
+        modified_operator_X = self.operator_X * _torch.exp(1j * self.phase_mod_x)
+        modified_operator_Y = self.operator_Y * _torch.exp(1j * self.phase_mod_y)
+        return modified_operator_Y @ field @ modified_operator_X
 
 class PropagatorСylindLens(PropagatorLens):
     """
@@ -164,6 +176,16 @@ class PropagatorСylindLens(PropagatorLens):
         operator_Y = _torch.ones_like(plane.linspace_by_y, dtype=_torch.cfloat)
         super(PropagatorСylindLens, self).__init__(_torch.diag_embed(operator_X),
                                                    _torch.diag_embed(operator_Y))
+        
+        # Обучаемые параметры для фазы модуляции (только по оси X для цилиндрической линзы)
+        self.phase_mod_x = _nn.Parameter(_torch.zeros_like(plane.linspace_by_x), requires_grad=True)
+
+    def forward(self, field: _torch.Tensor) -> _torch.Tensor:
+        """
+        Метод распространения светового поля через цилиндрическую линзу с обучаемой модуляцией фазы.
+        """
+        modified_operator_X = self.operator_X * _torch.exp(1j * self.phase_mod_x)
+        return self.operator_Y @ field @ modified_operator_X
 
 class PropagatorSinc(Propagator):
     """
@@ -185,6 +207,15 @@ class PropagatorSinc(Propagator):
                                                     second_plane,
                                                     config)
         super(PropagatorSinc, self).__init__(operator_X, operator_Y)
+        
+        # Обучаемые параметры для адаптивного распространения
+        # Фазовая модуляция для операторов
+        self.phase_mod_x = _nn.Parameter(_torch.zeros(operator_X.shape, dtype=_torch.float32), requires_grad=True)
+        self.phase_mod_y = _nn.Parameter(_torch.zeros(operator_Y.shape, dtype=_torch.float32), requires_grad=True)
+        
+        # Адаптивные коэффициенты амплитуды
+        self.amplitude_scale_x = _nn.Parameter(_torch.ones(1, dtype=_torch.float32), requires_grad=True)
+        self.amplitude_scale_y = _nn.Parameter(_torch.ones(1, dtype=_torch.float32), requires_grad=True)
 
     def __get_operator_for_dim(self,
                              pixel_size_in: float,
@@ -218,3 +249,14 @@ class PropagatorSinc(Propagator):
                                                difference_y,
                                                config)
         return operator_X, operator_Y
+
+    def forward(self, field: _torch.Tensor) -> _torch.Tensor:
+        """
+        Метод распространения светового поля через свободное пространство
+        с адаптивной модуляцией фазы и амплитуды.
+        """
+        # Применяем обучаемую фазовую модуляцию и масштабирование амплитуды
+        modified_operator_X = self.operator_X * _torch.exp(1j * self.phase_mod_x) * self.amplitude_scale_x
+        modified_operator_Y = self.operator_Y * _torch.exp(1j * self.phase_mod_y) * self.amplitude_scale_y
+        
+        return modified_operator_Y @ field @ modified_operator_X
