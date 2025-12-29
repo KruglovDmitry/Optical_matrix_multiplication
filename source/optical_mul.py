@@ -110,7 +110,7 @@ class OpticalMul(_nn.Module):
         vec_field = self.prepare_vector(input)
         mat_field = self.prepare_matrix(other)
 
-        vec_field = self._propagator_one(vec_field)
-        vec_field = self._propagator_two(vec_field * mat_field)
+        vec_field = self._propagator_one(vec_field, mat_field.shape[-2:])
+        vec_field = self._propagator_two(vec_field * mat_field, (mat_field.size(-2), 1))
 
         return self.prepare_out(vec_field)

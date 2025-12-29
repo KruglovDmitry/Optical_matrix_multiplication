@@ -92,7 +92,14 @@ class Propagator(_ABC, _nn.Module):
         """
         return self.cat(propagator)
 
-    def forward(self, field: _torch.Tensor) -> _torch.Tensor:
+    @staticmethod
+    def __slice_calculation(total_rows: int, num_to_take: int) -> slice:
+        start = (total_rows - num_to_take) // 2
+        end = start + num_to_take
+        return slice(start, end)
+        
+    def forward(self,
+                field: _torch.Tensor, resul_shape: None | _Tuple[int, int] | _torch.Size) -> _torch.Tensor:
         """
         Метод распространения светового поля в среде.
  
@@ -103,6 +110,20 @@ class Propagator(_ABC, _nn.Module):
             Распределение комплексной амплитуды светового поля,
             после распространения.
         """
+
+        if (resul_shape is not None):
+            field_shape = field.shape[-2:]
+            operator_Y_shape = self.operator_Y.shape[-2:]
+            operator_X_shape = self.operator_X.shape[-2:]
+
+            slice_one = Propagator.__slice_calculation(operator_Y_shape[0], resul_shape[0])
+            slice_two = Propagator.__slice_calculation(operator_Y_shape[1], field_shape[0])
+            slice_three=Propagator.__slice_calculation(operator_X_shape[0], field_shape[1])
+            slice_four= Propagator.__slice_calculation(operator_X_shape[1], resul_shape[1])
+
+            
+            return self.operator_Y[..., slice_one, slice_two] @ field @ self.operator_X[..., slice_three, slice_four]
+        
         return self.operator_Y @ field @ self.operator_X
 
 class PropagatorLens(Propagator):
