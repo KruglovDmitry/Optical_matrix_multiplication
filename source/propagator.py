@@ -2,7 +2,7 @@ import torch as _torch
 import torch.nn as _nn
 import numpy as _np
 from scipy.special import fresnel as _fresnel
-from .config import ConfigOpticBase as _ConfigOpticBase, ConfigDesignPlane as _ConfigDesignPlane
+from .config import ConfigOpticBase as _ConfigOpticBase, ConfigDesignPlane as _ConfigDesignPlane, LumaiOpticConfig as _LumaiOpticConfig
 from typing import Tuple as _Tuple, Sequence as _Sequence
 
 from abc import ABC as _ABC
@@ -239,3 +239,128 @@ class PropagatorSinc(Propagator):
                                                difference_y,
                                                config)
         return operator_X, operator_Y
+
+class PropagatorFanOut(PropagatorLens):
+    """
+    Fan-out линза Lumai — копирует каждый из M лазерных лучей
+    на всю ширину N дисплея весов.
+ 
+    Физика: рассеивающая линза (или дифракционная решётка) с апертурой,
+    покрывающей весь дисплей. Каждый точечный источник i даёт
+    расходящийся пучок, покрывающий все N столбцов дисплея.
+ 
+    В операторном формализме:
+        operator_X [1, N] — broadcast по оси столбцов.
+                            Каждый входной столбец отображается на все N выходных.
+        operator_Y [M, M] — единичная матрица по оси строк.
+                            Каждый лазер i независим от остальных.
+ 
+    Амплитудный профиль пучка моделируется как гауссов (наиболее реалистично
+    для одномодовых VCSEL), нормированный так чтобы суммарная мощность
+    каждого луча сохранялась.
+ 
+    Args:
+        laser_plane:   плоскость лазерных источников.
+        display_plane: плоскость дисплея весов.
+        config:        физические параметры установки.
+    """
+    def __init__(self,
+                 laser_plane: _ConfigDesignPlane,
+                 display_plane: _ConfigDesignPlane,
+                 config: _LumaiOpticConfig):
+        M = laser_plane.pixel_count_by_x
+        N = display_plane.pixel_count_by_x
+ 
+        # Гауссов профиль fan-out: каждый лазер освещает весь дисплей
+        # с амплитудой убывающей по гауссу от центра луча.
+        # beam_waist — радиус пучка на уровне 1/e (половина апертуры дисплея)
+        display_half_width = display_plane.aperture_width / 2.0
+        beam_waist = display_half_width  # пучок покрывает весь дисплей
+ 
+        x_display = display_plane.linspace_by_x  # [N]
+        # Амплитудный профиль по оси X: один вектор для всех лазеров
+        # (лазеры в 1D, поэтому fan-out одинаков для каждого)
+        gaussian_profile = _torch.exp(
+            -x_display**2 / (2 * beam_waist**2)
+        ).to(_torch.cfloat)  # [N]
+ 
+        # Нормировка: сохраняем мощность (интеграл |E|² = 1)
+        gaussian_profile = gaussian_profile / (gaussian_profile.abs()**2).sum().sqrt()
+ 
+        # operator_X: [1, N] — broadcast с весами гауссова профиля
+        # При умножении field[..., M, 1] @ operator_X[1, N]
+        # каждая строка M копируется в N с весами gaussian_profile
+        operator_X = gaussian_profile.unsqueeze(0)  # [1, N]
+ 
+        # operator_Y: [M, M] — единичная (лазеры независимы)
+        operator_Y = _torch.eye(M, dtype=_torch.cfloat)  # [M, M]
+ 
+        super().__init__(operator_X, operator_Y)
+ 
+class PropagatorSummingLens(PropagatorLens):
+    """
+    Суммирующая линза Lumai — физически собирает все M лучей
+    одного столбца j на один детектор j.
+ 
+    Физика: собирающая линза с фокусным расстоянием f = summing_distance.
+    В фокальной плоскости линзы формируется преобразование Фурье входного поля.
+    При некогерентном свете каждый детектор j меряет суммарную интенсивность
+    от всех M лазеров, прошедших через столбец j дисплея.
+ 
+    В операторном формализме:
+        operator_X [N, N] — единичная матрица по оси столбцов.
+                            Каждый столбец j независим.
+        operator_Y [1, M] — суммирование по оси строк.
+                            Все M лучей столбца j фокусируются на детектор j.
+ 
+    Амплитуда суммирования: для некогерентного света детектор меряет
+    сумму интенсивностей (не амплитуд), поэтому физически корректная
+    модель — это суммирование |E_i|² а не |ΣE_i|².
+    Однако в операторном формализме мы работаем с амплитудами,
+    а переход к интенсивности делается в prepare_out.
+ 
+    Args:
+        display_plane:   плоскость дисплея весов (входная плоскость линзы).
+        detector_plane:  плоскость детекторов (выходная плоскость линзы).
+        config:          физические параметры установки.
+    """
+    def __init__(self,
+                 display_plane: _ConfigDesignPlane,
+                 detector_plane: _ConfigDesignPlane,
+                 config: _LumaiOpticConfig):
+        M = display_plane.pixel_count_by_y
+        N = display_plane.pixel_count_by_x
+ 
+        # Физика суммирующей линзы:
+        # Каждый столбец j принимает свет от всех M строк.
+        # Амплитуда на детекторе j = сумма амплитуд по строкам i.
+        # Весовой профиль — апертурная функция линзы (прямоугольная апертура).
+        #
+        # Для физически корректной модели учитываем:
+        # 1. Апертуру линзы (ограничение по Y)
+        # 2. Фазовую маску линзы (квадратичная фаза)
+        # При некогерентном свете фаза не важна для интенсивности,
+        # но важна для когерентного режима.
+ 
+        # Апертура по Y: принимаем все M строк равномерно
+        # operator_Y [1, M]: суммирующий оператор
+        # Нормируем на sqrt(M) для сохранения энергии
+        operator_Y = _torch.ones(1, M, dtype=_torch.cfloat) / M**0.5  # [1, M]
+ 
+        # operator_X [N, N]: единичная матрица — столбцы независимы
+        operator_X = _torch.eye(N, dtype=_torch.cfloat)  # [N, N]
+ 
+        super().__init__(operator_X, operator_Y)
+ 
+class PropagatorFreeSpaceLumai(PropagatorSinc):
+    """
+    Свободное пространство между лазерами и дисплеем в установке Lumai.
+ 
+    Использует тот же физически точный sinc-пропагатор что и в 4f системе,
+    но с параметрами соответствующими геометрии Lumai:
+    короткое расстояние (~5 см) против 20 см в статье POMMM.
+ 
+    Это моделирует распространение гауссовых пучков VCSEL
+    от лазерной матрицы до плоскости дисплея весов.
+    """
+    pass  # Полностью наследуем PropagatorSinc — физика та же

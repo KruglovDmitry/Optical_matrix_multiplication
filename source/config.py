@@ -377,3 +377,89 @@ class Config(ConfigOpticBase, ConfigModelBase):
         """
         with open(filename, 'rb') as f:
             return _pickle.load(f)
+
+class LumaiOpticConfig(ConfigOpticBase):
+    """
+    Физические параметры оптической установки в стиле Lumai.
+ 
+    Lumai использует некогерентный свет и геометрическую оптику
+    вместо когерентной 4f системы с преобразованием Фурье.
+ 
+    Физический pipeline:
+        [VCSEL матрица] → [fan-out линза] → [3D объём] → [дисплей весов] → [суммирующая линза] → [детектор]
+ 
+    В отличие от 4f системы здесь нет скрещенных линз и цилиндрических линз Фурье.
+    Fan-out линза — это простая рассеивающая линза (или дифракционная решётка),
+    которая копирует каждый из M лазерных лучей на всю ширину N дисплея.
+    Суммирующая линза — собирающая линза, фокусирующая все M лучей
+    одного столбца j на один детектор j.
+ 
+    Args:
+        n_lasers:          число лазерных источников (VCSEL матрица).
+                           Определяет M — число строк матрицы весов за один такт.
+                           В Lumai = 1024.
+        n_outputs:         число детекторов (выходной вектор).
+                           Определяет N — число столбцов матрицы весов.
+                           В Lumai = 2048.
+        laser_pitch:       шаг между лазерами [м]. Типично для VCSEL: 10–50 мкм.
+        detector_pitch:    шаг между детекторами [м]. Типично: 10–25 мкм.
+        display_pitch:     шаг пикселя дисплея весов [м]. Типично: 3–10 мкм.
+        fanout_distance:   расстояние от лазеров до дисплея весов [м].
+        summing_distance:  расстояние от дисплея весов до детектора [м].
+        wavelength:        длина волны [м]. Lumai использует ~850 нм (VCSEL).
+        display_bits:      битность дисплея весов (квантование амплитуды).
+        incoherent:        True = некогерентное суммирование (интенсивности складываются).
+                           False = когерентное (амплитуды складываются, как в 4f).
+    """
+    def __init__(self,
+                 n_lasers: int = 1024,
+                 n_outputs: int = 2048,
+                 laser_pitch: float = 20e-6,
+                 detector_pitch: float = 20e-6,
+                 display_pitch: float = 8e-6,
+                 fanout_distance: float = 0.05,
+                 summing_distance: float = 0.05,
+                 wavelength: float = 850e-9,
+                 display_bits: int = 8,
+                 incoherent: bool = True):
+        super().__init__(wavelength, fanout_distance)
+ 
+        self.n_lasers = n_lasers
+        self.n_outputs = n_outputs
+        self.display_bits = display_bits
+        self.incoherent = incoherent
+        self.summing_distance = summing_distance
+ 
+        # Расчётные плоскости
+        # Плоскость лазеров: M точечных источников в 1D
+        self.laser_plane = _ConfigDesignPlane(
+            pixel_count=(1, n_lasers),
+            pixel_size=(laser_pitch, laser_pitch)
+        )
+ 
+        # Плоскость дисплея весов: M строк × N столбцов
+        # Каждый пиксель (i,j) = вес W[i,j]
+        self.display_plane = _ConfigDesignPlane(
+            pixel_count=(n_lasers, n_outputs),
+            pixel_size=(display_pitch, display_pitch)
+        )
+ 
+        # Плоскость детекторов: N точечных детекторов в 1D
+        self.detector_plane = _ConfigDesignPlane(
+            pixel_count=(1, n_outputs),
+            pixel_size=(detector_pitch, detector_pitch)
+        )
+ 
+        self._summing_distance = summing_distance
+ 
+    @property
+    def summing_distance_val(self) -> float:
+        return self._summing_distance
+    
+class SummingConfig(ConfigOpticBase):
+    """
+    Вспомогательный конфиг для sinc-пропагатора на этапе суммирования.
+    Использует summing_distance вместо fanout_distance.
+    """
+    def __init__(self, config: LumaiOpticConfig):
+        super().__init__(config.wavelength, config.summing_distance_val)
