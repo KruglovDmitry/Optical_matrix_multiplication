@@ -432,20 +432,20 @@ class LumaiOpticConfig(ConfigOpticBase):
  
         # Расчётные плоскости
         # Плоскость лазеров: M точечных источников в 1D
-        self.laser_plane = _ConfigDesignPlane(
+        self.laser_plane = ConfigDesignPlane(
             pixel_count=(1, n_lasers),
             pixel_size=(laser_pitch, laser_pitch)
         )
  
         # Плоскость дисплея весов: M строк × N столбцов
         # Каждый пиксель (i,j) = вес W[i,j]
-        self.display_plane = _ConfigDesignPlane(
+        self.display_plane = ConfigDesignPlane(
             pixel_count=(n_lasers, n_outputs),
             pixel_size=(display_pitch, display_pitch)
         )
  
         # Плоскость детекторов: N точечных детекторов в 1D
-        self.detector_plane = _ConfigDesignPlane(
+        self.detector_plane = ConfigDesignPlane(
             pixel_count=(1, n_outputs),
             pixel_size=(detector_pitch, detector_pitch)
         )
