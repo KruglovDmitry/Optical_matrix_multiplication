@@ -456,10 +456,3 @@ class LumaiOpticConfig(ConfigOpticBase):
     def summing_distance_val(self) -> float:
         return self._summing_distance
     
-class SummingConfig(ConfigOpticBase):
-    """
-    Вспомогательный конфиг для sinc-пропагатора на этапе суммирования.
-    Использует summing_distance вместо fanout_distance.
-    """
-    def __init__(self, config: LumaiOpticConfig):
-        super().__init__(config.wavelength, config.summing_distance_val)

@@ -1,7 +1,23 @@
 import torch as _torch
 import torch.nn as _nn
-from .config import Config as _Config, LumaiOpticConfig as _LumaiOpticConfig, SummingConfig as _SummingConfig
-from .propagator import PropagatorCrossLens as _PropCrossLens, PropagatorСylindLens as _PropСylindLens, PropagatorSinc as _PropSinc, Propagator as _Prop, PropagatorFreeSpaceLumai as _PropagatorFreeSpaceLumai, PropagatorFanOut as _PropagatorFanOut, PropagatorSummingLens as _PropagatorSummingLens
+import numpy as _np
+from .config import Config as _Config, LumaiOpticConfig as _LumaiOpticConfig
+from .propagator import PropagatorCrossLens as _PropCrossLens, PropagatorСylindLens as _PropСylindLens, PropagatorSinc as _PropSinc, Propagator as _Prop, PropagatorFreeSpaceLumai as _PropagatorFreeSpaceLumai, PropagatorSummingLens as _PropagatorSummingLens
+
+
+class _SummingConfig:
+    """Минимальный конфиг для sinc-пропагатора на этапе суммирования (использует summing_distance)."""
+    def __init__(self, wavelength: float, distance: float):
+        self._K = 2 * _np.pi / wavelength
+        self._distance = distance
+
+    @property
+    def distance(self) -> float:
+        return self._distance
+
+    @property
+    def K(self) -> float:
+        return self._K
 
 class OpticalMul(_nn.Module):
     """
@@ -174,78 +190,80 @@ class LumaiMul(_nn.Module):
         self._config = config
  
         # ── Строим операторы распространения ──────────────────────────────
- 
-        # Конфиг для второго этапа (дисплей → детектор)
-        # Используем тот же базовый конфиг но с summing_distance
-        config_summing = _SummingConfig(config)
- 
+
+        # Конфиг для второго этапа (дисплей → детектор) с summing_distance
+        config_summing = _SummingConfig(config.wavelength, config.summing_distance_val)
+
         # Этап 1: от лазеров до дисплея весов
-        #   prop_fs_in:  sinc-распространение (лазер → дисплей)
-        #   prop_fanout: fan-out линза (broadcast по столбцам)
-        prop_fs_in = _PropagatorFreeSpaceLumai(
+        #   sinc-распространение от точечных источников до дисплея (лазер → дисплей)
+        self._prop_fs_in = _PropagatorFreeSpaceLumai(
             config.laser_plane,
             config.display_plane,
             config
         )
-        prop_fanout = _PropagatorFanOut(
-            config.laser_plane,
-            config.display_plane,
-            config
-        )
- 
-        # Схлопываем в один оператор: field → display_plane
-        # (как prop_one + prop_two + prop_three в OpticalMul)
-        self._propagator_one: _Prop = prop_fs_in + prop_fanout
- 
+
+        # Fan-out профиль: гауссово распределение интенсивности по столбцам дисплея.
+        # Каждый лазерный луч i освещает все N столбцов с гауссовым профилем.
+        # Это физически правильнее чем операторная конкатенация, т.к. sinc-пропагатор
+        # уже выполняет дифракционное расплывание, а fan-out — это дополнительная
+        # весовая маска (линза с гауссовой апертурой), а не отдельный линейный оператор.
+        x_display = config.display_plane.linspace_by_x
+        display_half_width = config.display_plane.aperture_width / 2.0
+        beam_waist = display_half_width
+        fanout_profile = _torch.exp(-x_display**2 / (2 * beam_waist**2))
+        fanout_profile = fanout_profile / (fanout_profile.abs()**2).sum().sqrt()
+        self.register_buffer('_fanout_profile', fanout_profile.unsqueeze(0).unsqueeze(0).unsqueeze(0), persistent=True)
+
         # Этап 2: от дисплея весов до детекторов
-        #   prop_summing: суммирующая линза
-        #   prop_fs_out: sinc-распространение (дисплей → детектор)
-        prop_summing = _PropagatorSummingLens(
+        #   После адамарова умножения поле (M,N) на дисплее.
+        #   Сначала суммирующая линза сворачивает Y: (M,N) → (1,N).
+        #   Затем sinc-распространение от дисплея до детектора (1,N) → (1,N).
+        #
+        #   Не конкатенируем — operator_Y размерности не сойдутся (обе идут
+        #   display→detector, а не последовательно). Вместо этого применяем
+        #   поэтапно в forward (аналогично этапу 1).
+        self._prop_summing = _PropagatorSummingLens(
             config.display_plane,
             config.detector_plane,
             config
         )
-        prop_fs_out = _PropagatorFreeSpaceLumai(
+        self._prop_fs_out = _PropagatorFreeSpaceLumai(
             config.display_plane,
             config.detector_plane,
             config_summing
         )
- 
-        # Схлопываем в один оператор: display_plane → детектор
-        # (как prop_five + prop_six + prop_seven в OpticalMul)
-        self._propagator_two: _Prop = prop_summing + prop_fs_out
- 
+
         # Квантование дисплея весов (STE для обучения)
         self._display_bits = config.display_bits
-        self._display_levels = 2 ** config.display_bits - 1
- 
+
         # Некогерентный или когерентный режим детектора
         self._incoherent = config.incoherent
- 
-        # AvgPool для субпиксельного усреднения (аналог result_vector_split)
-        self._avg_pool = _nn.AvgPool2d((1, 1))
  
     def prepare_vector(self, data: _torch.Tensor) -> _torch.Tensor:
         """
         Подготовка левой матрицы как набора входных векторов.
- 
+  
         В Lumai входной вектор x[i] кодируется интенсивностью i-го лазера.
-        Лазеры расположены в 1D, поэтому поле имеет форму [H, M, 1] —
-        H независимых векторов, каждый из M элементов, в одном пространственном
-        измерении (ось Y = лазеры, ось X = 1 точка на лазер).
- 
+        Лазеры расположены в 1D (строка из M источников), поэтому
+        laser_plane имеет размер (Y=1, X=M). Поле подготавливается
+        с spatial shape (1, M), где ось Y = 1 строка лазеров, ось X = M лазеров.
+  
         Args:
             data: (B, C, H, M) — левая матрица
- 
+  
         Returns:
-            (B, C, H, M, 1) — каждый вектор как колонка поля
+            (B, C, H, 1, M) — spatial (Y=1, X=M), соответствует laser_plane
         """
         # Берём abs() потому что Lumai использует некогерентный свет —
         # интенсивность лазера (не фазу) кодирует значение.
         # Sqrt потому что детектор меряет |E|², а мы хотим чтобы
         # амплитуда E = sqrt(intensity) давала правильную интенсивность.
         data = data.abs().to(_torch.cfloat)
-        return data.unsqueeze(-1)  # (B, C, H, M, 1)
+        # Выход: (B, C, H, 1, M) — Y=1, X=M, соответствует laser_plane (1, M).
+        # Если сделать unsqueeze(-1) → (B,C,H,M,1), spatial (Y=M, X=1) не совпадёт
+        # с laser_plane (Y=1, X=M), и operator_Y [M, 1] @ field [..., M, 1] упадёт
+        # с несовпадением последней размерности (1 vs M).
+        return data.unsqueeze(-2)  # (B, C, H, 1, M)
  
     def prepare_matrix(self, data: _torch.Tensor) -> _torch.Tensor:
         """
@@ -273,7 +291,7 @@ class LumaiMul(_nn.Module):
  
         # Квантование дисплея (физическое ограничение битности)
         if self._display_bits is not None:
-            levels = self._display_levels
+            levels = 2 ** self._display_bits - 1
             data_q = _torch.round(data.real * levels) / levels
             data_q = data_q.to(_torch.cfloat)
             # Straight-through estimator: градиент проходит напрямую
@@ -316,13 +334,13 @@ class LumaiMul(_nn.Module):
  
         # Убираем лишнее измерение суммирования
         result = result.squeeze(-2)  # (B, C, H, N)
- 
+
         # Нормируем к масштабу матричного умножения
         # sqrt для некогерентного режима: |E|² → |E| ~ x@W
         if self._incoherent:
             result = result.sqrt()
- 
-        return self._avg_pool(result)
+
+        return result
  
     def forward(self,
                 input: _torch.Tensor,
@@ -332,11 +350,13 @@ class LumaiMul(_nn.Module):
  
         Pipeline:
             1. prepare_vector:    (B,C,H,M) → (B,C,H,M,1)
-            2. propagator_one:    (B,C,H,M,1) → (B,C,H,M,N)   [fan-out]
-            3. prepare_matrix:    (B,C,M,N) → (B,C,1,M,N)
-            4. Адамар:            field * weights → (B,C,H,M,N) [дисплей]
-            5. propagator_two:    (B,C,H,M,N) → (B,C,H,1,N)   [суммирование]
-            6. prepare_out:       (B,C,H,1,N) → (B,C,H,N)
+            2. free space sinc:   (B,C,H,M,1) → (B,C,H,M,N)   [лазер→дисплей]
+            3. fan-out profile:   гауссов вес по столбцам
+            4. prepare_matrix:    (B,C,M,N) → (B,C,1,M,N)
+            5. Адамар:            field * weights → (B,C,H,M,N) [дисплей]
+            6. summing lens:      (B,C,H,M,N) → (B,C,H,1,N)
+            7. free space sinc:   (B,C,H,1,N) → (B,C,H,1,N)   [дисплей→детектор]
+            8. prepare_out:       (B,C,H,1,N) → (B,C,H,N)
  
         Args:
             input: (B, C, H, M) — левая матрица
@@ -356,28 +376,34 @@ class LumaiMul(_nn.Module):
         # Шаг 1: подготовка входных данных
         vec_field = self.prepare_vector(input)   # (B,C,H,M,1)
         mat_field = self.prepare_matrix(other)   # (B,C,1,M,N)
- 
-        # Шаг 2: распространение от лазеров до дисплея (fan-out)
-        # Аналог: self._propagator_one(vec_field, mat_field.shape[-2:])
-        # operator_Y[M,M] @ field[M,1] @ operator_X[1,N] → field[M,N]
-        vec_field = self._propagator_one(
+
+        # Шаг 2: sinc-распространение от лазеров до дисплея
+        # operator_Y[M,1] @ field[M,1] @ operator_X[M,N] → field[M,N]
+        vec_field = self._prop_fs_in(
             vec_field,
             mat_field.shape[-2:]   # целевой размер: (M, N)
         )  # (B,C,H,M,N)
- 
-        # Шаг 3: Адамарово умножение на матрицу весов дисплея
-        # Точно как в OpticalMul: vec_field * mat_field
+
+        # Шаг 3: fan-out — гауссов вес по столбцам (апертура рассеивающей линзы)
+        vec_field = vec_field * self._fanout_profile  # (B,C,H,M,N)
+
+        # Шаг 4: Адамарово умножение на матрицу весов дисплея
         # mat_field broadcast по H: (B,C,1,M,N) → (B,C,H,M,N)
         vec_field = vec_field * mat_field  # (B,C,H,M,N)
- 
-        # Шаг 4: суммирующая линза + распространение до детектора
-        # operator_Y[1,M] @ field[M,N] @ operator_X[N,N] → field[1,N]
-        vec_field = self._propagator_two(
+
+        # Шаг 5: суммирующая линза: operator_Y[1,M] @ field[M,N] → field[1,N]
+        vec_field = self._prop_summing(
             vec_field,
             (1, mat_field.size(-1))  # целевой размер: (1, N)
         )  # (B,C,H,1,N)
- 
-        # Шаг 5: считываем результат с детектора
+
+        # Шаг 6: sinc-распространение от дисплея до детектора (1,N) → (1,N)
+        vec_field = self._prop_fs_out(
+            vec_field,
+            (1, mat_field.size(-1))
+        )  # (B,C,H,1,N)
+
+        # Шаг 6: считываем результат с детектора
         return self.prepare_out(vec_field)  # (B,C,H,N)
  
 class LumaiMulBlocked(_nn.Module):
