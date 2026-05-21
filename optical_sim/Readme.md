@@ -1,45 +1,72 @@
-CUDA kernels → PBO (pixel buffer object) → EGL offscreen → PNG/stream
-                                                              ↓
-                                                    веб-интерфейс или SSH -X
+# optical_sim — CUDA оптический симулятор
 
-# Структура проекта
+## Требования
+- CUDA Toolkit ≥ 12.0
+- CMake ≥ 3.20
+- GCC ≥ 11 (нужен C++17 для `std::filesystem`)
+- GPU: RTX 30xx/40xx (sm_86/sm_89) или H100 (sm_90)
 
+## Сборка на сервере
+
+```bash
+# 1. Клонируем / копируем проект
+cd optical_sim
+
+# 2. Скачиваем stb_image_write (header-only, нужен для PNG)
+wget -q https://raw.githubusercontent.com/nothings/stb/master/stb_image_write.h \
+     -O include/stb_image_write.h
+
+# 3. Собираем
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
+
+# 4. Запускаем тесты
+ctest --output-on-failure
+
+# 5. Запускаем симулятор
+#    Аргументы: [num_sources] [slm_cols]
+./optical_sim          # дефолт: 6 источников, SLM 256×6
+./optical_sim 8 512    # 8 источников, SLM 512×8
+```
+
+## Что получим в ./output/
+```
+1_source.png      — распределение интенсивности массива VCSEL
+2_collimator.png  — после коллимирующей линзы
+3_cyl_lens.png    — после цилиндрической линзы (fan-out)
+4_slm.png         — поле на SLM (с применённой маской)
+5_detector.png    — поле на детекторах
+```
+Все изображения в colormap **inferno**, нормированы к [0, 1].
+
+## Структура проекта
+```
 optical_sim/
-├── CMakeLists.txt
 ├── include/
-│   ├── config.hpp          ← параметры системы (λ, f, SLM size, N источников)
-│   ├── field.hpp           ← структура светового поля на плоскости
-│   ├── propagator.hpp      ← базовый класс пропагаторов
-│   └── renderer.hpp        ← OpenGL/EGL визуализация
-│
-├── src/
-│   ├── main.cpp            ← точка входа, UI логика
-│   └── renderer.cpp        ← EGL контекст, шейдеры
-│
+│   ├── config.hpp       — SystemConfig, Plane, PlaneID
+│   ├── field.hpp        — ComplexField, IntensityMap, CUDA_CHECK
+│   ├── propagator.hpp   — Operator, объявления build_* и apply_propagator
+│   └── pipeline.hpp     — fan_out, apply_slm, fan_in, intensity API
 ├── kernels/
-│   ├── fresnel.cu          ← PropagatorSinc на CUDA
-│   ├── lens.cu             ← CrossLens + CylindLens
-│   ├── fan.cu              ← fan-out и fan-in
-│   └── intensity.cu        ← |E|² + нормализация для рендера
-│
-└── shaders/
-    ├── field.vert
-    └── field.frag          ← colormap (например, inferno)
+│   ├── fresnel.cu       — PropagatorSinc (интегралы Френеля на GPU)
+│   ├── lens.cu          — CrossLens, CylindLens
+│   ├── fan.cu           — fan-out, fan-in, apply_slm
+│   └── intensity.cu     — |E|², нормализация, PNG (stb)
+├── src/
+│   └── main.cpp         — пайплайн: SOURCE→COLLIM→CYL→SLM→DETECTOR
+└── tests/
+    ├── test_field.cu    — аллокация, upload/download, intensity
+    └── test_fresnel.cu  — унитарность оператора Френеля
+```
 
-# Работа 
+## Следующие шаги
+- [ ] Заменить наивное матричное умножение на cuBLAS (`cublasZgemm`)
+- [ ] Добавить OpenGL/EGL визуализацию в реальном времени
+- [ ] Параллельный запуск нескольких источников через CUDA streams
+- [ ] Экспорт данных в numpy (.npy) для сравнения с Python версией
 
-main.cpp
-  │
-  ├─ загружает SystemConfig (из файла или интерактивно)
-  │
-  ├─ SimulationPipeline::run()
-  │    ├─ fan_out_kernel<<<>>>()      VCSEL → все строки SLM
-  │    ├─ fresnel_kernel<<<>>>()      свободное пространство
-  │    ├─ lens_kernel<<<>>>()         линзы
-  │    ├─ slm_multiply<<<>>>()        умножение на матрицу W
-  │    ├─ fan_in_kernel<<<>>>()       суммирование на PD
-  │    └─ intensity_kernel<<<>>>()    |E|² для каждого слоя
-  │
-  └─ Renderer::draw(PlaneID)          выбираем какой слой смотреть
+
+# Графическая схема
 
   ![alt text](image.png)
