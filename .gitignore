@@ -1,3 +1,5 @@
 __pycache__/
 .ipynb_checkpoints/
 .venv
+/optical_sim/build
+/optical_sim/include/stb_image_write.h

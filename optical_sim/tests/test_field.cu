@@ -3,6 +3,7 @@
 #include <cmath>
 #include <vector>
 #include "field.hpp"
+#include "pipeline.hpp"
 
 int main()
 {
