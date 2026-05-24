@@ -77,7 +77,7 @@ __global__ void k_build_sinc_op(cuComplex* __restrict__ op,
     float cos_p, sin_p;
     sincosf(phase, &sin_p, &cos_p);
 
-    op[i_out * n_in + i_in] = make_cuComplex(
+    op[i_in * n_out + i_out] = make_cuComplex(
         scale * (cos_p * dC + sin_p * dS),
         scale * (sin_p * dC - cos_p * dS)
     );
@@ -107,9 +107,9 @@ void build_sinc_operator_x(Operator& op,
                              const Plane& src, const Plane& dst,
                              const SystemConfig& cfg, cudaStream_t stream)
 {
-    launch_sinc_op(op, src.nx, dst.nx,
-                   dst.dx, src.dx,
-                   dst.aperture_x(), src.aperture_x(),
+    launch_sinc_op(op, dst.nx, src.nx,
+                   src.dx, dst.dx,
+                   src.aperture_x(), dst.aperture_x(),
                    cfg, stream);
 }
 
@@ -117,6 +117,13 @@ void build_sinc_operator_y(Operator& op,
                              const Plane& src, const Plane& dst,
                              const SystemConfig& cfg, cudaStream_t stream)
 {
+    // Для плоскостей с ny=1 оператор по Y — единичная матрица
+    if (src.ny == 1 && dst.ny == 1) {
+        cuComplex one = make_cuComplex(1.f, 0.f);
+        CUDA_CHECK(cudaMemcpy(op.data, &one, sizeof(cuComplex),
+                              cudaMemcpyHostToDevice));
+        return;
+    }
     launch_sinc_op(op, dst.ny, src.ny,
                    src.dy, dst.dy,
                    src.aperture_y(), dst.aperture_y(),
