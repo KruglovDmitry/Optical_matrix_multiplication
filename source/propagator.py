@@ -167,7 +167,7 @@ class PropagatorCrossLens(PropagatorLens):
         super(PropagatorCrossLens, self).__init__(_torch.diag_embed(operator_X),
                                                   _torch.diag_embed(operator_Y))
 
-class PropagatorСylindLens(PropagatorLens):
+class PropagatorCylindLens(PropagatorLens):
     """
     Класс распространения света в цилиндрической линзе,
     представленной тонким оптическим элементом.
@@ -183,7 +183,7 @@ class PropagatorСylindLens(PropagatorLens):
         """
         operator_X = _torch.exp(-1j * config.K / config.distance * plane.linspace_by_x**2)
         operator_Y = _torch.ones_like(plane.linspace_by_y, dtype=_torch.cfloat)
-        super(PropagatorСylindLens, self).__init__(_torch.diag_embed(operator_X),
+        super(PropagatorCylindLens, self).__init__(_torch.diag_embed(operator_X),
                                                    _torch.diag_embed(operator_Y))
 
 class PropagatorSinc(Propagator):
@@ -239,3 +239,135 @@ class PropagatorSinc(Propagator):
                                                difference_y,
                                                config)
         return operator_X, operator_Y
+
+#######################################################################################################################
+
+class PropagatorTrainableCylindLens(_ABC, _nn.Module):
+    """
+    Класс распространения света в обучаемой цилиндрической линзе,
+    представленной тонким прозрачным оптическим элементом.
+    """
+    def __init__(self, 
+        plane: _ConfigDesignPlane,
+        config: _ConfigOpticBase
+    ):
+        super().__init__()       
+        # non smooth profile after training. better to train only focal length?
+        self._operator_X_phi = _nn.Parameter(config.K / config.distance * plane.linspace_by_x**2)
+        operator_Y = _torch.diag_embed(_torch.ones_like(plane.linspace_by_y, dtype=_torch.cfloat))
+        operator_Y = _torch.view_as_real(operator_Y)
+        self.register_buffer('_operator_Y', operator_Y, persistent=True)
+
+    @property
+    def operator_X(self) -> _torch.Tensor:
+        """
+        Returns:
+            оператор отображающий распроcтранение светового поля вдоль оси абсцисс
+        """
+        return _torch.diag_embed(_torch.exp(-1j * self._operator_X_phi))
+
+    @property
+    def operator_Y(self) -> _torch.Tensor:
+        """
+        Returns:
+            оператор отображающий распроcтранение светового поля вдоль оси ординат
+        """
+        return _torch.view_as_complex(self._operator_Y)
+
+    @staticmethod
+    def __slice_calculation(total_rows: int, num_to_take: int) -> slice:
+        start = (total_rows - num_to_take) // 2
+        end = start + num_to_take
+        return slice(start, end)
+        
+    def forward(self,
+                field: _torch.Tensor, resul_shape: None | _Tuple[int, int] | _torch.Size) -> _torch.Tensor:
+        """
+        Метод распространения светового поля в среде.
+ 
+        Args:
+            field: распределение комплексной амплитуды светового поля.
+
+        Returns:
+            Распределение комплексной амплитуды светового поля,
+            после распространения.
+        """
+
+        if (resul_shape is not None):
+            field_shape = field.shape[-2:]
+            operator_Y_shape = self.operator_Y.shape[-2:]
+            operator_X_shape = self.operator_X.shape[-2:]
+
+            slice_one = PropagatorTrainableCylindLens.__slice_calculation(operator_Y_shape[0], resul_shape[0])
+            slice_two = PropagatorTrainableCylindLens.__slice_calculation(operator_Y_shape[1], field_shape[0])
+            slice_three = PropagatorTrainableCylindLens.__slice_calculation(operator_X_shape[0], field_shape[1])
+            slice_four = PropagatorTrainableCylindLens.__slice_calculation(operator_X_shape[1], resul_shape[1])
+            return self.operator_Y[..., slice_one, slice_two] @ field @ self.operator_X[..., slice_three, slice_four]
+        
+        return self.operator_Y @ field @ self.operator_X
+
+
+class PropagatorTrainableFocalDistCylindLens(_ABC, _nn.Module):
+    """
+    Класс распространения света в обучаемой цилиндрической линзе,
+    представленной тонким прозрачным оптическим элементом.
+    """
+    def __init__(self, 
+        plane: _ConfigDesignPlane,
+        config: _ConfigOpticBase
+    ):
+        super().__init__()       
+        self._distance = _nn.Parameter(_torch.tensor(config.distance))
+        self.register_buffer('_K', _torch.tensor(config.K), persistent=True)
+        self.register_buffer('_linspace_by_x', plane.linspace_by_x.detach().clone(), persistent=True)
+        operator_Y = _torch.diag_embed(_torch.ones_like(plane.linspace_by_y, dtype=_torch.cfloat))
+        operator_Y = _torch.view_as_real(operator_Y)
+        self.register_buffer('_operator_Y', operator_Y, persistent=True)
+
+    @property
+    def operator_X(self) -> _torch.Tensor:
+        """
+        Returns:
+            оператор отображающий распроcтранение светового поля вдоль оси абсцисс
+        """
+        return _torch.diag_embed(_torch.exp(-1j * self._K / self._distance * self._linspace_by_x**2))
+
+    @property
+    def operator_Y(self) -> _torch.Tensor:
+        """
+        Returns:
+            оператор отображающий распроcтранение светового поля вдоль оси ординат
+        """
+        return _torch.view_as_complex(self._operator_Y)
+
+    @staticmethod
+    def __slice_calculation(total_rows: int, num_to_take: int) -> slice:
+        start = (total_rows - num_to_take) // 2
+        end = start + num_to_take
+        return slice(start, end)
+        
+    def forward(self,
+                field: _torch.Tensor, resul_shape: None | _Tuple[int, int] | _torch.Size) -> _torch.Tensor:
+        """
+        Метод распространения светового поля в среде.
+ 
+        Args:
+            field: распределение комплексной амплитуды светового поля.
+
+        Returns:
+            Распределение комплексной амплитуды светового поля,
+            после распространения.
+        """
+
+        if (resul_shape is not None):
+            field_shape = field.shape[-2:]
+            operator_Y_shape = self.operator_Y.shape[-2:]
+            operator_X_shape = self.operator_X.shape[-2:]
+
+            slice_one = PropagatorTrainableFocalDistCylindLens.__slice_calculation(operator_Y_shape[0], resul_shape[0])
+            slice_two = PropagatorTrainableFocalDistCylindLens.__slice_calculation(operator_Y_shape[1], field_shape[0])
+            slice_three = PropagatorTrainableFocalDistCylindLens.__slice_calculation(operator_X_shape[0], field_shape[1])
+            slice_four = PropagatorTrainableFocalDistCylindLens.__slice_calculation(operator_X_shape[1], resul_shape[1])
+            return self.operator_Y[..., slice_one, slice_two] @ field @ self.operator_X[..., slice_three, slice_four]
+        
+        return self.operator_Y @ field @ self.operator_X
