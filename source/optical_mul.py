@@ -4,7 +4,8 @@ from .config import Config as _Config
 from .propagator import PropagatorCrossLens as _PropCrossLens, PropagatorCylindLens as _PropСylindLens, PropagatorSinc as _PropSinc, Propagator as _Prop
 from .propagator import (
     PropagatorTrainableCylindLens as _PropagatorTrainableCylindLens,
-    PropagatorTrainableFocalDistCylindLens as _PropagatorTrainableFocalDistCylindLens
+    PropagatorTrainableFocalDistCylindLens as _PropagatorTrainableFocalDistCylindLens,
+    PropagatorTrainableSLMDOE as _PropagatorTrainableSLMDOE,
 )
 from torch.utils.tensorboard import SummaryWriter
 from typing import Optional
@@ -237,6 +238,10 @@ class TrainableLensOpticalMul(_nn.Module):
 
         return self.prepare_out(vec_field)
 
+    @property
+    def optical_trainable_params(self):
+        return list(self._propagator_cylind_lens.parameters())
+
     @_torch.no_grad()
     def log_cylind_lens_operator_x(
         self,
@@ -248,10 +253,10 @@ class TrainableLensOpticalMul(_nn.Module):
         # This ensures values outside [-pi, pi] wrap correctly
         complex_op = _torch.exp(-1j * self._propagator_cylind_lens._operator_X_phi)
         wrapped_phase = _torch.angle(complex_op).float() # Range: [-π, π]
-        
+
         # 2. Normalize for Image Visualization [0, 1]
         phase_normalized = (wrapped_phase + _torch.pi) / (2 * _torch.pi)
-        
+
         # 3. Log as a 1-pixel high row
         # Shape: [1, 1, Width]
         phase_row = phase_normalized.unsqueeze(0).unsqueeze(0)
@@ -264,12 +269,11 @@ class TrainableLensOpticalMul(_nn.Module):
         ax.set_ylabel("Phase (rad)")
         ax.set_ylim([-_torch.pi - 0.5, _torch.pi + 0.5])
         ax.grid(True, linestyle='--', alpha=0.6)
-        
-        
+
+
         # Send the figure to the "Plots" or "Images" tab in TensorBoard
         writer.add_figure(f"{tag}/phase_profile", fig, global_step)
         plt.close(fig) # Important: prevent memory leaks
-
 
 class TrainableFocalDistLensOpticalMul(_nn.Module):
     """
@@ -386,6 +390,10 @@ class TrainableFocalDistLensOpticalMul(_nn.Module):
 
         return self.prepare_out(vec_field)
 
+    @property
+    def optical_trainable_params(self):
+        return list(self._propagator_cylind_lens.parameters())
+
     @_torch.no_grad()
     def log_cylind_lens_operator_x(
         self,
@@ -416,7 +424,72 @@ class TrainableFocalDistLensOpticalMul(_nn.Module):
         ax.set_ylabel("Phase (rad)")
         ax.set_ylim([-_torch.pi - 0.5, _torch.pi + 0.5])
         ax.grid(True, linestyle='--', alpha=0.6)
-        
+
         # Send the figure to the "Plots" or "Images" tab in TensorBoard
         writer.add_figure(f"{tag}/phase_profile", fig, global_step)
         plt.close(fig) # Important: prevent memory leaks
+
+class TrainableSLMDOEOpticalMul(_nn.Module):
+    """
+    Оптическое умножение с обучаемым ДОЭ после плоскости SLM.
+
+    Отличие от TrainableLensOpticalMul: ДОЭ применяется не к вектор-полю
+    до взаимодействия с матрицей, а к СКОМБИНИРОВАННОМУ полю (vec × mat) —
+    сразу после SLM, перед дальнейшим распространением.
+
+    Это позволяет корректировать 2D пространственные искажения интенсивности
+    в плоскости SLM. Параметров: H × W (64×64 = 4096 для матриц 64×64).
+    """
+    def __init__(self, config: _Config):
+        super().__init__()
+
+        prop_one   = _PropSinc(config.input_vector_plane, config.first_lens_plane, config)
+        prop_two   = _PropCrossLens(config.first_lens_plane, config)
+        prop_three = _PropSinc(config.first_lens_plane, config.matrix_plane, config)
+        prop_four  = _PropСylindLens(config.matrix_plane, config)   # фиксированная цилиндрическая линза
+        prop_five  = _PropSinc(config.matrix_plane, config.second_lens_plane, config)
+        prop_six   = _PropCrossLens(config.second_lens_plane, config).T
+        prop_seven = _PropSinc(config.second_lens_plane, config.output_vector_plane, config)
+
+        self._propagator_one: _Prop = prop_one + prop_two + prop_three + prop_four
+        self._slm_doe = _PropagatorTrainableSLMDOE(config.matrix_plane)
+        self._propagator_two: _Prop = prop_five + prop_six + prop_seven
+
+        kron_vec_utils = _torch.ones((config.input_vector_split_y, config.input_vector_split_x))
+        kron_mat_utils = _torch.ones((config.matrix_split_x, config.matrix_split_y))
+        self.register_buffer('_kron_vec_utils', kron_vec_utils, persistent=True)
+        self.register_buffer('_kron_mat_utils', kron_mat_utils, persistent=True)
+
+        self._avg_pool = _nn.AvgPool2d((1, config.result_vector_split))
+
+    def prepare_vector(self, data: _torch.Tensor) -> _torch.Tensor:
+        data = data.cfloat().flip(-1)
+        data = data.unsqueeze(-2)
+        data = _torch.kron(data.contiguous(), self._kron_vec_utils)
+        return data
+
+    def prepare_matrix(self, data: _torch.Tensor) -> _torch.Tensor:
+        if (data.dim() > 4) and data.size(-1) == 2:
+            data = _torch.view_as_complex(data)
+        data = data.cfloat().transpose(-2, -1)
+        data = data.unsqueeze(-3)
+        data = _torch.kron(data.contiguous(), self._kron_mat_utils)
+        return data
+
+    def prepare_out(self, field: _torch.Tensor) -> _torch.Tensor:
+        field = field.abs().squeeze(-1)
+        field = self._avg_pool(field)
+        return field.flip(-1)
+
+    @property
+    def optical_trainable_params(self):
+        return list(self._slm_doe.parameters())
+
+    def forward(self, input: _torch.Tensor, other: _torch.Tensor) -> _torch.Tensor:
+        vec_field = self.prepare_vector(input)
+        mat_field = self.prepare_matrix(other)
+        vec_field = self._propagator_one(vec_field, mat_field.shape[-2:])
+        # ДОЭ после SLM: модулирует скомбинированное поле перед дальнейшим распространением
+        vec_field = self._slm_doe(vec_field * mat_field)
+        vec_field = self._propagator_two(vec_field, (mat_field.size(-2), 1))
+        return self.prepare_out(vec_field)

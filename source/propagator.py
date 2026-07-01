@@ -242,6 +242,27 @@ class PropagatorSinc(Propagator):
 
 #######################################################################################################################
 
+class PropagatorTrainableSLMDOE(_nn.Module):
+    """
+    Обучаемый ДОЭ в плоскости SLM.
+    Применяется ПОСЛЕ взаимодействия поля вектора с матрицей SLM.
+    Параметр: 2D фазовый профиль φ(y,x), инициализирован нулями (нет эффекта).
+    """
+    def __init__(self, plane: _ConfigDesignPlane):
+        super().__init__()
+        H = int(plane.pixel_count_by_y)
+        W = int(plane.pixel_count_by_x)
+        self._phi = _nn.Parameter(_torch.zeros(H, W))
+
+    def forward(self, field: _torch.Tensor) -> _torch.Tensor:
+        """Применяет фазовую маску exp(iφ) к полю (..., H, W).
+        Адаптируется к реальному размеру поля — при T < block_size берётся срез маски.
+        """
+        H, W = field.shape[-2:]
+        phi = self._phi[:H, :W]
+        return field * _torch.exp(1j * phi)
+
+
 class PropagatorTrainableCylindLens(_ABC, _nn.Module):
     """
     Класс распространения света в обучаемой цилиндрической линзе,
