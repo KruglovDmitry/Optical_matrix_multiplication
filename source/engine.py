@@ -3,23 +3,38 @@ optics.py — переиспользуемая обёртка над оптич�
 для встраивания оптического матричного умножения в трансформер.
 
 Ключевая идея — переключаемость: каждый матмул можно независимо гонять либо
-через оптический sim, либо через обычный torch. Это позволяет одним и тем же
-кодом собирать любую конфигурацию (всё оптическое / только внимание / только
-линейные / полностью цифровой baseline) и честно их сравнивать.
+через оптический sim, либо через обычный torch, а режим градиента выбирается
+одним параметром движка.
+
+Режимы градиента (backward=):
+  * 'twin'     (по умолчанию) — PAT-S: forward через (шумный) физический тракт,
+                straight-through только вокруг sim; градиент — через цифровой
+                двойник (матмул × калибровка) и цифровой конвейер нормировок.
+                Эмпирически эквивалентен полному autograd (зазор 0.2–3% ppl),
+                ~2x быстрее, не хранит активации пропагатора. Контракт железа:
+                устройству нужен только forward + свежая калибровка.
+  * 'autograd' — полный autograd сквозь пропагаторы sim. Нужен для линии
+                обучаемых оптических элементов (add-parameters) и как эталон.
+  * 'optical'  — полный офлоад: градиентные произведения тоже через оптику
+                (знаковый дизеринг обязателен). Цена +11–15% ppl (реалистичный
+                шум: больше); опция для случаев, когда цифра недоступна.
+
+История: режимы PAT (чистый двойник) и PAT-N (двойник со статистическим шумом)
+удалены как проигравшие абляции — см. git-тег pat-s-validated и write-up.
+Механизм: адаптации весов к шуму нужен градиент, коррелированный с РЕАЛИЗАЦИЕЙ
+шума forward-прохода; она входит через измеренную невязку и нормировки a·b.
 
 Компоненты:
-  * optics_matmul   — примитив (сдвиг → нормировка → sim → масштаб → поправки),
-                      проверен численно против torch-матмула до ~1e-13;
-  * OpticalEngine   — единый «движок»: один omm.OpticalMul, единый gain,
-                      единый конфиг апертуры, автоматический тайлинг матриц > апертуры;
-  * mm(...)         — диспетчер: optical → engine.matmul, иначе → torch.matmul;
-  * OpticLinear     — линейный слой (вес [in, out]) с флагом optical;
-  * OpticalAttention— весь блок внимания в обёртке; независимые флаги proj_optical
-                      (q/k/v/o) и attn_optical (q@kᵀ и attn@v).
+  * OpticalNoiseModel — модель неидеальностей устройства (SLM, детектор, АЦП,
+                        белый шум усиления, медленный дрейф);
+  * optics_matmul     — примитив (сдвиг → нормировка → sim → масштаб → поправки);
+  * OpticalEngine     — движок: один omm.OpticalMul, калибровки (скаляр gain +
+                        попиксельные flat-field карты), тайлинг с батчированием;
+  * mm(...)           — диспетчер optical/torch;
+  * OpticLinear, OpticalAttention — слои с переключаемым бэкендом.
 
 Контракт симулятора (README): вход — два 4D-тензора
-    left (B, C, H, W) и right (B, C, W, K)  →  выход (B, C, H, K),
-т.е. батч-матмул по двум ведущим осям. Движок приводит операнды к 4D сам.
+    left (B, C, H, W) и right (B, C, W, K)  →  выход (B, C, H, K).
 """
 import math
 import torch
@@ -27,12 +42,16 @@ import torch.nn as nn
 from torch.nn import functional as F
 from torch.nn import init
 from einops import rearrange
-from .config import Config 
+from .config import Config
 from .optical_mul import OpticalMul
 
 # Физическая «усилка» симулятора: sim(X,Y) ~ 3.44e-3 * (X@Y). gain_inv её компенсирует.
-# ВНИМАНИЕ: константа откалибрована под апертуру 512; для другой конфигурации
-# используй OpticalEngine.calibrate_gain().
+# ВНИМАНИЕ: скаляр зависит от апертуры И от формы матриц (краевые эффекты:
+# полная апертура 512 даёт ~2.46e-3, малые центральные матрицы ~3.43e-3).
+# Точный масштаб на форму обеспечивают flat-field карты; скалярный gain задаёт
+# лишь единицы полной шкалы детектора (full_scale = k/gain) для шумовой модели.
+# Менять процедуру калибровки среди серии экспериментов нельзя — поплывут
+# единицы сигм. calibrate_gain() сохранён в прежнем виде ради непрерывности.
 SIM_GAIN_INV = 1.0 / 3.44e-3
 
 
@@ -301,79 +320,69 @@ def optics_matmul(sim, A, B, eps=1e-8, gain=1.0, noise=None, stats=None,
     return out
 
 
+
+
 class OpticalEngine(nn.Module):
     """
     Единый источник правды для оптических матмулов: один omm.OpticalMul, конфиг
-    апертуры и калибровка gain. Создаётся один раз на модель и передаётся во все слои.
+    апертуры и калибровки. Создаётся один раз на модель и передаётся во все слои.
 
     matmul(a, b) считает a @ b по последним двум осям:
       * a:[...,M,K], b:[...,K,N] (или b — 2D-вес [K,N], broadcast по батчу);
       * все размеры <= size → один optics_matmul;
-      * иначе тайлинг: по M/N — блоки <= size и конкатенация; по контракции K —
-        чанки и суммирование (матмул линеен по K, поправки по-чанково точны).
+      * иначе тайлинг: по M/N — блоки, по контракции K — чанки с суммированием.
+        Тайлы (i,j) независимы и БАТЧИРУЮТСЯ в ведущую ось sim группами по
+        tile_batch (края дозаполняются нулями до единого размера — поправки
+        от нулей точны, а единая форма означает одну flat-field карту на все
+        тайлы). tile_batch=None (по умолчанию) — последовательный путь.
+        Батчирование выгодно на GPU (меньше запусков ядер, выше утилизация);
+        на CPU оно МЕДЛЕННЕЕ из-за паддинга. Перед включением провалидируй
+        на своей карте (см. бенчмарк в experiments).
         Тайлинг физически честен: реальная апертура фиксирована.
+
+    backward: 'twin' (PAT-S, по умолчанию) | 'autograd' | 'optical'.
     """
     def __init__(self, size=512, pixel_size=3.6e-6, gain_inv=SIM_GAIN_INV,
                  splits=2, distance=0.01, noise=None, flat_field=True,
-                 ff_trials=8, pat=False, pat_noisy_twin=False,
-                 pat_surgical=False, optical_backward=False, ob_dither=True):
+                 ff_trials=8, backward='twin', ob_dither=True, tile_batch=None):
         super().__init__()
+        assert backward in ('twin', 'autograd', 'optical'), backward
         self.size = size
         self.gain = gain_inv
         # Шумовая модель устройства (OpticalNoiseModel или None — идеальный sim).
-        # Подмодуль: наследует .train()/.eval() от модели.
         self.noise = noise
         # Аудит усиления шума: включай точечно, читай через pop_stats().
         self.collect_stats = False
         self.stats = {}
-        # Flat-field: sim (и реальный тракт) имеет фиксированную позиционную
-        # неоднородность усиления ~0.3–1%, которая после вычитания поправок
-        # раздувается сокращением до ошибок 10%+ на центрированных данных.
-        # Карты калибруются лениво на каждую встреченную форму (M,K,N)
-        # усреднением ff_trials реперных прогонов (аналог усреднения кадров
-        # на устройстве) и применяются в цифровом постпроцессинге.
+        # Flat-field: фиксированная позиционная неоднородность усиления тракта
+        # (~0.3–1%) после вычитания поправок раздувается сокращением до 10%+
+        # на центрированных данных. Карты калибруются лениво на каждую форму
+        # (M,K,N) усреднением ff_trials прогонов (аналог усреднения кадров) и
+        # применяются в цифровом постпроцессинге. КРИТИЧНО: карта участвует и
+        # в двойнике backward='twin' — двойник обязан знать устройство
+        # настолько, насколько его знает калибровка.
         self.flat_field = flat_field
         self.ff_trials = ff_trials
         self._ff_maps = {}
-        # Physics-Aware Training (Wright et al., Nature 2022): forward — через
-        # шумный физический тракт, backward — через цифровой двойник
-        # (straight-through). Это контракт реального устройства: железо умеет
-        # только forward, градиент считает цифровой двойник. Бонус: sim
-        # выполняется под no_grad — гигантские активации пропагатора не
-        # сохраняются для backward, память падает в разы.
-        #
-        # pat_noisy_twin: двойник с той же шумовой моделью (тот же конвейер
-        # сдвигов/нормировок/шума/поправок, но matmul вместо sim). Идеально
-        # чистый двойник стерилизует шум градиента, а именно он — существенная
-        # часть механизма адаптации весов к шуму (стадия P свипа). Реализации
-        # шума в forward и двойнике независимы: важна статистика, не
-        # реализация (на железе реализация и не наблюдаема).
-        # Примечание: при дрейфе (gain_drift) двойник шагает OU-процесс
-        # вторым вызовом detect — эффективное tau в вызовах делится на два.
-        self.pat = pat
-        self.pat_noisy_twin = pat_noisy_twin
-        # pat_surgical (PAT-S): приоритетнее pat; граница straight-through
-        # только вокруг sim, цифровой конвейер в autograd (см. optics_matmul).
-        self.pat_surgical = pat_surgical
-        # optical_backward (только с pat_surgical): градиентные произведения
-        # тоже через оптику — полный офлоад, 0 больших цифровых матмулов.
-        # ob_dither ОБЯЗАТЕЛЕН на практике: без него детерминированная
-        # неидеальность тракта даёт систематический bias градиента и плато
-        # (стадия O без дизера: 11.2 vs 6.06). Флаг оставлен для абляций.
-        self.optical_backward = optical_backward
+        self.backward = backward
+        # Знаковый дизеринг оптического backward. ОБЯЗАТЕЛЕН на практике:
+        # без него детерминированная неидеальность тракта даёт систематический
+        # bias градиента (фактор ~0.65) и плато (11.2 vs 6.06 ppl).
+        # Флаг оставлен только для абляций.
         self.ob_dither = ob_dither
+        self.tile_batch = tile_batch
         self.sim = OpticalMul(
             Config(right_matrix_count_columns=size,
-                       right_matrix_count_rows=size,
-                       right_matrix_width=pixel_size * size,
-                       right_matrix_height=pixel_size * size,
-                       min_height_gap=pixel_size,
-                       right_matrix_split_x=splits,
-                       right_matrix_split_y=splits,
-                       left_matrix_split_x=splits,
-                       left_matrix_split_y=splits,
-                       result_matrix_split=splits,
-                       distance=distance)
+                   right_matrix_count_rows=size,
+                   right_matrix_width=pixel_size * size,
+                   right_matrix_height=pixel_size * size,
+                   min_height_gap=pixel_size,
+                   right_matrix_split_x=splits,
+                   right_matrix_split_y=splits,
+                   left_matrix_split_x=splits,
+                   left_matrix_split_y=splits,
+                   result_matrix_split=splits,
+                   distance=distance)
         )
 
     @staticmethod
@@ -406,40 +415,19 @@ class OpticalEngine(nn.Module):
         return m
 
     def _mm(self, a4, b4):
-        ffmap = None
-        if self.flat_field:
-            ffmap = self._get_ff_map(a4.shape[-2], a4.shape[-1], b4.shape[-1],
-                                     a4.device, torch.float32)
-        if self.pat_surgical:
-            return optics_matmul(self.sim, a4, b4, gain=self.gain,
-                                 noise=self.noise,
-                                 stats=self.stats if self.collect_stats else None,
-                                 ffmap=ffmap, sim_st=True,
-                                 bwd_engine=self if self.optical_backward else None)
-        if self.pat:
-            # Значение — с (шумного) физического тракта, градиент — от
-            # цифрового двойника. Sim под no_grad: активации не копятся.
-            with torch.no_grad():
-                phys = optics_matmul(self.sim, a4, b4, gain=self.gain,
-                                     noise=self.noise,
-                                     stats=self.stats if self.collect_stats else None,
-                                     ffmap=ffmap)
-            if self.pat_noisy_twin and self.noise is not None:
-                # Двойник = тот же конвейер optics_matmul, но matmul вместо
-                # sim (масштаб /gain воспроизводит сырые интенсивности —
-                # шумовая модель ложится в той же полной шкале). Градиент
-                # несёт честную статистику шума устройства.
-                twin_sim = lambda P, Q: torch.matmul(P, Q) / self.gain
-                ref = optics_matmul(twin_sim, a4, b4, gain=self.gain,
-                                    noise=self.noise, ffmap=None)
-            else:
-                ref = torch.matmul(a4, b4)
-            return ref + (phys - ref).detach()
-        return optics_matmul(self.sim, a4, b4, gain=self.gain, noise=self.noise,
-                             stats=self.stats if self.collect_stats else None,
-                             ffmap=ffmap)
+        ffmap = (self._get_ff_map(a4.shape[-2], a4.shape[-1], b4.shape[-1],
+                                  a4.device, torch.float32)
+                 if self.flat_field else None)
+        stats = self.stats if self.collect_stats else None
+        # Двойник нужен только когда строится граф; на инференсе (no_grad)
+        # и в режиме autograd идём обычной веткой — цифровой матмул не считается.
+        need_twin = self.backward != 'autograd' and torch.is_grad_enabled() and (a4.requires_grad or b4.requires_grad)
+        return optics_matmul(
+            self.sim, a4, b4, gain=self.gain, noise=self.noise,
+            stats=stats, ffmap=ffmap, sim_st=need_twin,
+            bwd_engine=self if (need_twin and self.backward == 'optical') else None)
 
-    def _tiled_matmul(self, a4, b4):
+    def _tiled_sequential(self, a4, b4):
         s = self.size
         M, K = a4.shape[-2], a4.shape[-1]
         N = b4.shape[-1]
@@ -456,6 +444,45 @@ class OpticalEngine(nn.Module):
             rows.append(torch.cat(cols, dim=-1))
         return torch.cat(rows, dim=-2)
 
+    def _tiled_matmul(self, a4, b4):
+        s = self.size
+        M, K = a4.shape[-2], a4.shape[-1]
+        N = b4.shape[-1]
+        # Батчированный путь требует свободной ведущей оси (наш стандартный
+        # лэйаут: активации [1,B,T,K], веса [1,1,K,N]); иначе — последовательно.
+        if (self.tile_batch is None
+                or a4.shape[0] != 1 or b4.shape[0] != 1):
+            return self._tiled_sequential(a4, b4)
+        n_i, n_j, n_k = -(-M // s), -(-N // s), -(-K // s)
+        if n_i * n_j == 1:
+            return self._tiled_sequential(a4, b4)
+        # Нулевое дозаполнение до кратности s: нулевые строки/столбцы дают
+        # нулевой вклад в контракцию, поправки на дозаполненных матрицах точны.
+        Ap = F.pad(a4, (0, n_k * s - K, 0, n_i * s - M))
+        Bp = F.pad(b4, (0, n_j * s - N, 0, n_k * s - K))
+        Ca, Cb = Ap.shape[1], Bp.shape[1]
+        # Тайлы: A -> [n_i, n_k, Ca, s, s], B -> [n_k, n_j, Cb, s, s]
+        At = Ap[0].reshape(Ca, n_i, s, n_k, s).permute(1, 3, 0, 2, 4)
+        Bt = Bp[0].reshape(Cb, n_k, s, n_j, s).permute(1, 3, 0, 2, 4)
+        P = n_i * n_j
+        ii = torch.arange(P, device=a4.device) // n_j
+        jj = torch.arange(P, device=a4.device) % n_j
+        out = None
+        for kk in range(n_k):
+            acc_k = []
+            for p0 in range(0, P, self.tile_batch):
+                sl = slice(p0, min(p0 + self.tile_batch, P))
+                left = At[ii[sl], kk]          # [p, Ca, s, s]
+                right = Bt[kk, jj[sl]]         # [p, Cb, s, s]
+                acc_k.append(self._mm(left, right))
+            part = torch.cat(acc_k, dim=0)     # [P, C, s, s]
+            out = part if out is None else out + part
+        C = out.shape[1]
+        out = (out.reshape(n_i, n_j, C, s, s)
+                  .permute(2, 0, 3, 1, 4)
+                  .reshape(1, C, n_i * s, n_j * s))
+        return out[..., :M, :N]
+
     def matmul(self, a, b):
         a4, b4 = self._to_4d(a), self._to_4d(b)
         if max(a4.shape[-2], a4.shape[-1], b4.shape[-1]) <= self.size:
@@ -467,14 +494,14 @@ class OpticalEngine(nn.Module):
     @torch.no_grad()
     def value_matmul(self, a, b):
         """Оптическое значение произведения без ST/двойника (для backward
-        и любых мест, где нужен только результат). Временное отключение
-        PAT-флагов не потокобезопасно — исследовательский код."""
-        save = (self.pat_surgical, self.pat)
-        self.pat_surgical = self.pat = False
+        и любых мест, где нужен только результат). Временное переключение
+        режима не потокобезопасно — исследовательский код."""
+        save = self.backward
+        self.backward = 'autograd'
         try:
             return self.matmul(a, b)
         finally:
-            self.pat_surgical, self.pat = save
+            self.backward = save
 
     def pop_stats(self):
         """Средний и максимальный коэффициент усиления шума с момента прошлого вызова."""
@@ -487,10 +514,13 @@ class OpticalEngine(nn.Module):
     @torch.no_grad()
     def calibrate_gain(self, n_trials=8, device=None, dtype=torch.float32):
         """
-        Автокалибровка gain по реперным неотрицательным матрицам: МНК-оценка
-        масштаба sim относительно точного матмула. SIM_GAIN_INV верен только
-        для апертуры 512 — для любой другой конфигурации (и для реального
-        устройства при дрейфе) вызывай это перед работой.
+        Автокалибровка скалярного gain по реперным матрицам ПОЛНОЙ апертуры.
+        Внимание: из-за краевых эффектов этот скаляр отличается от масштаба
+        малых центральных матриц на десятки процентов — это НОРМАЛЬНО и
+        безопасно: точный масштаб на форму дают flat-field карты (в т.ч.
+        внутри двойника backward='twin'). Скаляр задаёт лишь единицы полной
+        шкалы детектора для шумовой модели; процедура сохранена неизменной
+        ради непрерывности единиц сигм между сериями экспериментов.
         """
         was = self.noise
         self.noise = None          # калибруемся на чистом тракте
