@@ -9,4 +9,4 @@ from . import propagator
 from .optical_mul import OpticalMul
 from .parallel import DataParallel
 from .engine import (OpticalEngine, OpticLinear, OpticalAttention,
-                     OpticalNoiseModel, SIM_GAIN_INV)
+                     OpticalNoiseModel, SIM_GAIN_INV, DEVICE_PROFILES)

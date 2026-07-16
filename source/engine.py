@@ -15,9 +15,9 @@ optics.py — переиспользуемая обёртка над оптич�
                 устройству нужен только forward + свежая калибровка.
   * 'autograd' — полный autograd сквозь пропагаторы sim. Нужен для линии
                 обучаемых оптических элементов (add-parameters) и как эталон.
-  * 'optical'  — полный офлоад: градиентные произведения тоже через оптику
-                (знаковый дизеринг обязателен). Цена +11–15% ppl (реалистичный
-                шум: больше); опция для случаев, когда цифра недоступна.
+  Полный оптический офлоад (градиенты через оптику + знаковый дизеринг)
+  исследован и удалён из кода как неосновной: результаты и реализация — в
+  git-тегах ob-dither / optical-backward и в отчёте (+11–15% ppl).
 
 История: режимы PAT (чистый двойник) и PAT-N (двойник со статистическим шумом)
 удалены как проигравшие абляции — см. git-тег pat-s-validated и write-up.
@@ -53,6 +53,26 @@ from .optical_mul import OpticalMul
 # Менять процедуру калибровки среди серии экспериментов нельзя — поплывут
 # единицы сигм. calibrate_gain() сохранён в прежнем виде ради непрерывности.
 SIM_GAIN_INV = 1.0 / 3.44e-3
+
+# Именованные профили устройства — единый источник правды для геометрии.
+# Числа в скриптах не дублируются: движок и эксперименты ссылаются на профиль,
+# явные аргументы поверх профиля выигрывают.
+DEVICE_PROFILES = {
+    # исторический профиль программы d13 (воспроизводимость старых серий);
+    # ВНИМАНИЕ: вне чистой зоны точность падает, см. geometry_probe
+    'd13':      dict(distance=0.01, lens_size=8192, tile_size=None,
+                     tile_batch=None),
+    # быстрый чистый профиль кампании d12: N_F~2 на тайле, ошибка ~0.25%
+    'fast_d12': dict(distance=0.05, lens_size=8192, tile_size=128,
+                     tile_batch=16),
+    # геометрия прототипа от оптиков, численно СОШЕДШАЯСЯ конфигурация:
+    # окно 32768 обязательно (16384 недосэмплирует поле на z=0.15 — ошибки
+    # x100; проверено geometry_probe 2026-07-16). Тайл 128 — равномерные
+    # ~0.2-0.3% по всем формам; окно влияет только на предвычисление
+    # операторов, рантайм и память вызовов от него не зависят.
+    'proto':    dict(distance=0.15, lens_size=32768, tile_size=128,
+                     tile_batch=16),
+}
 
 
 class OpticalNoiseModel(nn.Module):
@@ -172,145 +192,123 @@ class OpticalNoiseModel(nn.Module):
                 f"enabled={self.enabled}, eval_noise={self.eval_noise}")
 
 
-def _reduce_to_shape(g, shape):
-    """Свернуть broadcast-оси градиента к форме исходного тензора."""
-    while g.dim() > len(shape):
-        g = g.sum(0)
-    for i, (gs, ss) in enumerate(zip(g.shape, shape)):
-        if ss == 1 and gs != 1:
-            g = g.sum(i, keepdim=True)
-    return g
-
-
-def _dithered_value_mm(eng, A, B):
-    """
-    Оптическое произведение со знаковым дизерингом: случайные ±1 по строкам A
-    и столбцам B коммутируют с матмулом (флипы снимаются в цифре после
-    измерения), но полностью меняют реализацию сдвигов/нормировок каждый
-    вызов. Детерминированная входозависимая неидеальность тракта из
-    систематического bias градиента (фактор ~0.65 на живых градиентах)
-    превращается в средненулевой шум между шагами, который SGD усредняет.
-    Флипы по строкам/столбцам не пересекают операнды — broadcast-формы
-    не расширяются, лишних проходов нет.
-    """
-    r2 = lambda *sh: (torch.randint(0, 2, sh, device=A.device) * 2 - 1).to(A.dtype)
-    sr = r2(*A.shape[:-2], A.shape[-2], 1)   # знаки строк A -> строки результата
-    sc = r2(*B.shape[:-2], 1, B.shape[-1])   # знаки столбцов B -> столбцы результата
-    return eng.value_matmul(A * sr, B * sc) * sr * sc
-
-
-class _OpticalGemmGrad(torch.autograd.Function):
-    """
-    Ref-узел PAT-S с оптическим backward (полный офлоад обучения).
-
-    Forward возвращает НУЛИ: значение ref сокращается в straight-through
-    (raw = ref + (raw_phys − ref).detach() даёт raw_phys при любом значении
-    ref), поэтому цифровой матмул в forward не нужен вовсе.
-
-    Backward считает оба градиентных произведения (G@Qnᵀ и Pnᵀ@G) через
-    (шумную) оптику: градиенты — это просто матмулы, дифференцируемость
-    сквозь них не требуется. Итог: 3 оптических прохода, 0 больших цифровых
-    матмулов — так работают и мемристорные кроссбары. Вопрос эксперимента:
-    терпит ли обучение шум устройства в самих градиентах.
-    """
-    @staticmethod
-    def forward(ctx, Pn, Qn, engine):
-        ctx.save_for_backward(Pn, Qn)
-        ctx.engine = engine
-        shape = (torch.broadcast_shapes(Pn.shape[:-2], Qn.shape[:-2])
-                 + (Pn.shape[-2], Qn.shape[-1]))
-        return Pn.new_zeros(shape)
-
-    @staticmethod
-    def backward(ctx, grad_out):
-        Pn, Qn = ctx.saved_tensors
-        eng = ctx.engine
-        mm = (_dithered_value_mm if getattr(eng, 'ob_dither', True)
-              else lambda e, a, b: e.value_matmul(a, b))
-        with torch.no_grad():
-            dP = mm(eng, grad_out, Qn.transpose(-2, -1))
-            dQ = mm(eng, Pn.transpose(-2, -1), grad_out)
-        return (_reduce_to_shape(dP, Pn.shape),
-                _reduce_to_shape(dQ, Qn.shape), None)
-
-
-def optics_matmul(sim, A, B, eps=1e-8, gain=1.0, noise=None, stats=None,
-                  ffmap=None, sim_st=False, bwd_engine=None):
-    """
-    Приближённо вычисляет A @ B через неотрицательный оптический sim.
-    A: [..., M, K], B: [..., K, N] — уже 4D с согласованными (или broadcast)
-    ведущими осями (об этом заботится OpticalEngine).
-
-    Оптика принимает только неотрицательные интенсивности, поэтому:
-      1) строки A и столбцы B сдвигаются в неотрицательную область (sa, sb);
-      2) сдвинутые P, Q нормируются в [0,1] (делением на построчный/постолбцовый max);
-      3) sim перемножает нормированные матрицы, масштаб восстанавливается (* a * b * gain);
-      4) три поправки за сдвиг вычитаются аналитически (в честном масштабе — gain на них НЕ идёт).
-    Раскрытие (A+sa)(B+sb) даёт ровно эти поправки — результат равен A @ B.
-
-    noise — OpticalNoiseModel или None. Шум модуляции ложится на нормированные
-    входы sim, шум детектора — на сырой выход ДО * a * b * gain, поэтому его
-    вклад в результат усиливается пропорционально масштабу P@Q (то самое
-    катастрофическое сокращение при вычитании поправок).
-
-    stats — mutable dict для аудита усиления шума: накапливает отношение
-    ||PQ|| / ||A@B|| (во сколько раз аддитивный шум детектора раздувается
-    относительно полезного сигнала).
-    """
+def _twin_pipeline(A, B, delta, gain, ffmap, eps=1e-8):
+    """Цифровой конвейер двойника с инъекцией сохранённой невязки δ.
+    Вызывается дважды: в forward (значение) и в backward (граф) — дёшево,
+    т.к. это чистая цифра без sim. δ несёт реализацию физики/шума."""
     k = A.shape[-1]
-    sa = torch.clamp(-A.amin(dim=-1, keepdim=True), min=0)   # [...,M,1]
-    sb = torch.clamp(-B.amin(dim=-2, keepdim=True), min=0)   # [...,1,N]
+    sa = torch.clamp(-A.amin(dim=-1, keepdim=True), min=0)
+    sb = torch.clamp(-B.amin(dim=-2, keepdim=True), min=0)
     P, Q = A + sa, B + sb
     a = P.amax(dim=-1, keepdim=True).clamp_min(eps)
     b = Q.amax(dim=-2, keepdim=True).clamp_min(eps)
-    Pn, Qn = P / a, Q / b
-    if sim_st:
-        # PAT-S («хирургический»): straight-through ТОЛЬКО вокруг физического
-        # блока sim+детектор. Сдвиги, нормировки a·b и поправки — цифровые
-        # шаги хоста и на реальном устройстве, они остаются в autograd с
-        # РЕАЛИЗОВАННЫМИ значениями. Невязка δ = (измерено − предсказано)
-        # наблюдаема на железе; реализация шума протекает в градиент через
-        # член raw_phys·∂(a·b)/∂A — главный канал адаптации при полном
-        # autograd. Приближается только якобиан внутренностей sim (цена
-        # ~+1.6% по P_baseline). Sim под no_grad — активации не копятся.
+    ref = torch.matmul(P / a, Q / b) / gain
+    if ffmap is not None:
+        ref = ref / ffmap.clamp_min(1e-12)
+    raw = ref + delta
+    if ffmap is not None:
+        raw = raw * ffmap
+    PQ = raw * a * b * gain
+    corr_a = sb * A.sum(dim=-1, keepdim=True)
+    corr_b = sa * B.sum(dim=-2, keepdim=True)
+    return PQ - corr_a - corr_b - k * sa * sb
+
+
+class _TwinMM(torch.autograd.Function):
+    """
+    Memory-light twin (backward='twin'): вместо хранения ~6 промежуточных
+    тензоров конвейера на каждый тайл (OOM на глубоких моделях) сохраняем
+    только входы (view активаций) и невязку δ = raw_phys − ref. Backward
+    пересчитывает цифровой конвейер под enable_grad — дёшево относительно
+    sim; sim НЕ перезапускается; градиент идентичен прежней sim_st-ветке
+    (тот же граф; значение raw = ref + δ = физическое, реализационный канал
+    через a·b сохранён).
+    """
+    @staticmethod
+    def forward(ctx, A, B, engine):
+        gain, noise, sim = engine.gain, engine.noise, engine.sim
+        ffmap = None
+        if engine.flat_field:
+            ffmap = engine._get_ff_map(A.shape[-2], A.shape[-1], B.shape[-1],
+                                       A.device, torch.float32)
+        k = A.shape[-1]
         with torch.no_grad():
+            sa = torch.clamp(-A.amin(dim=-1, keepdim=True), min=0)
+            sb = torch.clamp(-B.amin(dim=-2, keepdim=True), min=0)
+            P, Q = A + sa, B + sb
+            a = P.amax(dim=-1, keepdim=True).clamp_min(1e-8)
+            b = Q.amax(dim=-2, keepdim=True).clamp_min(1e-8)
+            Pn, Qn = P / a, Q / b
             Pm = noise.modulate(Pn) if noise is not None else Pn
             Qm = noise.modulate(Qn) if noise is not None else Qn
             raw_phys = sim(Pm, Qm)
             if noise is not None:
                 raw_phys = noise.detect(raw_phys, full_scale=k / gain)
-        if bwd_engine is not None:
-            # Оптический backward: forward-значение ref — нули (сократится),
-            # градиентные произведения посчитает оптика в Function.backward.
-            ref = _OpticalGemmGrad.apply(Pn, Qn, bwd_engine) / gain
-        else:
             ref = torch.matmul(Pn, Qn) / gain
-        if ffmap is not None:
-            # КРИТИЧНО: двойник обязан включать калибровку устройства.
-            # raw_phys ≈ matmul/(gain·ffmap), и ref должен жить в том же
-            # масштабе, иначе δ содержит большую детерминированную часть
-            # (в т.ч. скалярную ошибку gain — например, calibrate_gain на
-            # полной апертуре даёт до ~40% сдвига для малых матриц), которая
-            # ломает сокращение нормировочных градиентов и медленно сносит
-            # обучение. С картой в ref δ ≈ шум + малый входозависимый остаток.
-            ref = ref / ffmap.clamp_min(1e-12)
-        raw = ref + (raw_phys - ref).detach()
-    else:
-        if noise is not None:
-            Pn, Qn = noise.modulate(Pn), noise.modulate(Qn)
-        raw = sim(Pn, Qn)                   # сырые интенсивности детектора
-        if noise is not None:
-            raw = noise.detect(raw, full_scale=k / gain)
+            if ffmap is not None:
+                ref = ref / ffmap.clamp_min(1e-12)
+            delta = raw_phys - ref
+            out = _twin_pipeline(A, B, delta, gain, ffmap)
+            if engine.collect_stats:
+                s = engine.stats
+                ff = ffmap if ffmap is not None else 1.0
+                amp = ((raw_phys * ff * a * b * gain).norm()
+                       / out.norm().clamp_min(1e-12)).item()
+                s['amp_sum'] = s.get('amp_sum', 0.0) + amp
+                s['amp_max'] = max(s.get('amp_max', 0.0), amp)
+                s['calls'] = s.get('calls', 0) + 1
+        ctx.save_for_backward(A, B, delta)
+        ctx.gain, ctx.ffmap = gain, ffmap
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        A, B, delta = ctx.saved_tensors
+        with torch.enable_grad():
+            A_ = A.detach().requires_grad_(A.requires_grad)
+            B_ = B.detach().requires_grad_(B.requires_grad)
+            out = _twin_pipeline(A_, B_, delta, ctx.gain, ctx.ffmap)
+            wanted = [t for t in (A_, B_) if t.requires_grad]
+            gs = list(torch.autograd.grad(out, wanted, grad_out))
+        gA = gs.pop(0) if A.requires_grad else None
+        gB = gs.pop(0) if B.requires_grad else None
+        return gA, gB, None
+
+
+def optics_matmul(sim, A, B, eps=1e-8, gain=1.0, noise=None, stats=None,
+                  ffmap=None):
+    """
+    Приближённо вычисляет A @ B через неотрицательный оптический sim
+    (полный autograd-путь; используется в режиме backward='autograd' и на
+    инференсе). Обучение в режиме 'twin' идёт через _TwinMM.
+
+    Оптика принимает только неотрицательные интенсивности, поэтому:
+      1) строки A и столбцы B сдвигаются в неотрицательную область (sa, sb);
+      2) сдвинутые P, Q нормируются в [0,1];
+      3) sim перемножает нормированные матрицы, масштаб восстанавливается;
+      4) три поправки за сдвиг вычитаются аналитически.
+
+    noise — OpticalNoiseModel или None; ffmap — flat-field карта (цифровой
+    постпроцессинг после детектора); stats — аудит усиления шума.
+    """
+    k = A.shape[-1]
+    sa = torch.clamp(-A.amin(dim=-1, keepdim=True), min=0)
+    sb = torch.clamp(-B.amin(dim=-2, keepdim=True), min=0)
+    P, Q = A + sa, B + sb
+    a = P.amax(dim=-1, keepdim=True).clamp_min(eps)
+    b = Q.amax(dim=-2, keepdim=True).clamp_min(eps)
+    Pn, Qn = P / a, Q / b
+    if noise is not None:
+        Pn, Qn = noise.modulate(Pn), noise.modulate(Qn)
+    raw = sim(Pn, Qn)                       # сырые интенсивности детектора
+    if noise is not None:
+        raw = noise.detect(raw, full_scale=k / gain)
     if ffmap is not None:
-        # Flat-field: попиксельная коррекция фиксированной неоднородности
-        # усиления. Применяется ПОСЛЕ детектора/АЦП — как в цифровом
-        # постпроцессинге реального устройства.
         raw = raw * ffmap
     PQ = raw * a * b * gain
     corr_a = sb * A.sum(dim=-1, keepdim=True)
     corr_b = sa * B.sum(dim=-2, keepdim=True)
-    corr_c = k * sa * sb
-    out = PQ - corr_a - corr_b - corr_c
+    out = PQ - corr_a - corr_b - k * sa * sb
     if stats is not None:
         with torch.no_grad():
             amp = (PQ.norm() / out.norm().clamp_min(1e-12)).item()
@@ -318,8 +316,6 @@ def optics_matmul(sim, A, B, eps=1e-8, gain=1.0, noise=None, stats=None,
             stats['amp_max'] = max(stats.get('amp_max', 0.0), amp)
             stats['calls'] = stats.get('calls', 0) + 1
     return out
-
-
 
 
 class OpticalEngine(nn.Module):
@@ -344,10 +340,28 @@ class OpticalEngine(nn.Module):
     """
     def __init__(self, size=512, pixel_size=3.6e-6, gain_inv=SIM_GAIN_INV,
                  splits=2, distance=0.01, noise=None, flat_field=True,
-                 ff_trials=8, backward='twin', ob_dither=True, tile_batch=None):
+                 ff_trials=8, backward='twin', tile_batch=None,
+                 tile_size=None, lens_size=8192, rows_per_call=4096):
         super().__init__()
-        assert backward in ('twin', 'autograd', 'optical'), backward
+        assert backward in ('twin', 'autograd'), backward
         self.size = size
+        # РАБОЧАЯ АПЕРТУРА: точность симулятора рушится к краям поля
+        # (драйверы — поперечные ширины K и N: рел. ошибка на центрированных
+        # данных ~1% при 64, ~10% при 128, ~100% при 256, >2000% при 512).
+        # tile_size принудительно нарезает все матмулы на тайлы ≤ tile_size
+        # в чистой центральной зоне. Для сравнимых серий (лестница масштабов)
+        # tile_size обязан быть одинаковым во всех ранах — иначе «размер
+        # модели» спутается с «качеством устройства». None = вся апертура
+        # (поведение d13; формы d13 несли до ~40% детерминированной ошибки,
+        # которую сеть абсорбировала адаптацией — задокументированный факт).
+        self.tile_size = min(tile_size or size, size)
+        # Бюджет СТРОК на один sim-вызов: каждая строка левой матрицы — это
+        # отдельное поле, и транзиентная память пропагатора ~ строки × ширина².
+        # Пары тайлов (tile_batch) не учитывают ведущую ось (у внимания это
+        # batch×heads, в разы больше, чем у FF) — группировка режется так,
+        # чтобы p · C · tile_size <= rows_per_call. 4096 строк ~ 6-12 ГБ
+        # транзиента на апертуре 512; поднимайте при свободной памяти.
+        self.rows_per_call = rows_per_call
         self.gain = gain_inv
         # Шумовая модель устройства (OpticalNoiseModel или None — идеальный sim).
         self.noise = noise
@@ -365,11 +379,6 @@ class OpticalEngine(nn.Module):
         self.ff_trials = ff_trials
         self._ff_maps = {}
         self.backward = backward
-        # Знаковый дизеринг оптического backward. ОБЯЗАТЕЛЕН на практике:
-        # без него детерминированная неидеальность тракта даёт систематический
-        # bias градиента (фактор ~0.65) и плато (11.2 vs 6.06 ppl).
-        # Флаг оставлен только для абляций.
-        self.ob_dither = ob_dither
         self.tile_batch = tile_batch
         self.sim = OpticalMul(
             Config(right_matrix_count_columns=size,
@@ -382,7 +391,8 @@ class OpticalEngine(nn.Module):
                    left_matrix_split_x=splits,
                    left_matrix_split_y=splits,
                    result_matrix_split=splits,
-                   distance=distance)
+                   distance=distance,
+                   lens_size=lens_size)
         )
 
     @staticmethod
@@ -419,16 +429,20 @@ class OpticalEngine(nn.Module):
                                   a4.device, torch.float32)
                  if self.flat_field else None)
         stats = self.stats if self.collect_stats else None
-        # Двойник нужен только когда строится граф; на инференсе (no_grad)
-        # и в режиме autograd идём обычной веткой — цифровой матмул не считается.
-        need_twin = self.backward != 'autograd' and torch.is_grad_enabled() and (a4.requires_grad or b4.requires_grad)
-        return optics_matmul(
-            self.sim, a4, b4, gain=self.gain, noise=self.noise,
-            stats=stats, ffmap=ffmap, sim_st=need_twin,
-            bwd_engine=self if (need_twin and self.backward == 'optical') else None)
+        # twin: memory-light двойник (_TwinMM), только когда строится граф;
+        # инференс и режим autograd — обычный путь без цифрового матмула
+        # (в autograd градиент идёт сквозь sim).
+        if (self.backward == 'twin' and torch.is_grad_enabled()
+                and (a4.requires_grad or b4.requires_grad)):
+            return _TwinMM.apply(a4, b4, self)
+        ffmap = (self._get_ff_map(a4.shape[-2], a4.shape[-1], b4.shape[-1],
+                                  a4.device, torch.float32)
+                 if self.flat_field else None)
+        return optics_matmul(self.sim, a4, b4, gain=self.gain,
+                             noise=self.noise, stats=stats, ffmap=ffmap)
 
     def _tiled_sequential(self, a4, b4):
-        s = self.size
+        s = self.tile_size
         M, K = a4.shape[-2], a4.shape[-1]
         N = b4.shape[-1]
         rows = []
@@ -445,7 +459,7 @@ class OpticalEngine(nn.Module):
         return torch.cat(rows, dim=-2)
 
     def _tiled_matmul(self, a4, b4):
-        s = self.size
+        s = self.tile_size
         M, K = a4.shape[-2], a4.shape[-1]
         N = b4.shape[-1]
         # Батчированный путь требует свободной ведущей оси (наш стандартный
@@ -467,11 +481,15 @@ class OpticalEngine(nn.Module):
         P = n_i * n_j
         ii = torch.arange(P, device=a4.device) // n_j
         jj = torch.arange(P, device=a4.device) % n_j
+        # шаг группы: не больше tile_batch пар И не больше rows_per_call строк
+        Ca = At.shape[2]
+        p_step = max(1, min(self.tile_batch,
+                            self.rows_per_call // max(1, Ca * s)))
         out = None
         for kk in range(n_k):
             acc_k = []
-            for p0 in range(0, P, self.tile_batch):
-                sl = slice(p0, min(p0 + self.tile_batch, P))
+            for p0 in range(0, P, p_step):
+                sl = slice(p0, min(p0 + p_step, P))
                 left = At[ii[sl], kk]          # [p, Ca, s, s]
                 right = Bt[kk, jj[sl]]         # [p, Cb, s, s]
                 acc_k.append(self._mm(left, right))
@@ -484,24 +502,20 @@ class OpticalEngine(nn.Module):
         return out[..., :M, :N]
 
     def matmul(self, a, b):
+        # Dtype-граница: симулятор живёт в fp32/complex64; модель может быть
+        # в bf16/fp16 (H100, nanochat). Касты на входе-выходе, градиент через
+        # них проходит штатно. Внутренняя точность sim остаётся fp32 — она
+        # должна быть лишь ниже шумового пола устройства.
+        in_dtype = a.dtype
+        if in_dtype in (torch.bfloat16, torch.float16):
+            a, b = a.float(), b.float()
         a4, b4 = self._to_4d(a), self._to_4d(b)
-        if max(a4.shape[-2], a4.shape[-1], b4.shape[-1]) <= self.size:
+        if max(a4.shape[-2], a4.shape[-1], b4.shape[-1]) <= self.tile_size:
             out4 = self._mm(a4, b4)
         else:
             out4 = self._tiled_matmul(a4, b4)
-        return out4[0] if a.dim() == 3 else out4
-
-    @torch.no_grad()
-    def value_matmul(self, a, b):
-        """Оптическое значение произведения без ST/двойника (для backward
-        и любых мест, где нужен только результат). Временное переключение
-        режима не потокобезопасно — исследовательский код."""
-        save = self.backward
-        self.backward = 'autograd'
-        try:
-            return self.matmul(a, b)
-        finally:
-            self.backward = save
+        out = out4[0] if a.dim() == 3 else out4
+        return out.to(in_dtype) if out.dtype != in_dtype else out
 
     def pop_stats(self):
         """Средний и максимальный коэффициент усиления шума с момента прошлого вызова."""
@@ -640,7 +654,8 @@ class OpticalAttention(nn.Module):
         v = self._split(self.v_proj(x), B, T)
         if self.rope is not None:
             q, k = self.rope(q), self.rope(k)
-        scores = mm(self.engine, q, k.transpose(-2, -1), self.attn_optical) * (self.h_dim ** -0.5)
+        head_dim = self.h_dim // self.num_heads
+        scores = mm(self.engine, q, k.transpose(-2, -1), self.attn_optical) * (head_dim ** -0.5)
         if self.causal:
             if (self._mask is None or self._mask.size(0) < T
                     or self._mask.device != x.device):
