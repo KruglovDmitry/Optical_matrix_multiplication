@@ -12,5 +12,8 @@ from .parallel import DataParallel
 from .engine import (OpticalEngine, OpticLinear, OpticalAttention,
                      OpticalNoiseModel, SIM_GAIN_INV, DEVICE_PROFILES)
 from .partial_coherence import (TransferMatrix, PartialCoherentMul,
-                                VCSELArraySpec, crosstalk_error,
-                                epsilon_vs_averaging, wavelength_sensitivity)
+                                VCSELArraySpec, IncoherentMVM,
+                                encode_amplitude, encode_intensity,
+                                decode_intensity,
+                                crosstalk_error, epsilon_vs_averaging,
+                                wavelength_sensitivity)

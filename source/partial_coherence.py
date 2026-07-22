@@ -32,20 +32,9 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
 
 import torch
+from .config import Config
+from .optical_mul import OpticalMul
 
-# --- импорт исходного движка (репо лежит рядом либо установлено как пакет) ---
-try:
-    from .config import Config
-    from .optical_mul import OpticalMul
-except ImportError:  # pragma: no cover - удобство запуска из другого корня
-    import sys, pathlib
-    _here = pathlib.Path(__file__).resolve()
-    for p in [_here.parents[2] / "repo", _here.parents[1], _here.parents[2]]:
-        if (p / "source" / "optical_mul.py").exists():
-            sys.path.insert(0, str(p))
-            break
-    from .config import Config
-    from .optical_mul import OpticalMul
 
 
 # ============================================================================
@@ -270,6 +259,81 @@ class PartialCoherentMul:
             acc += f.abs().square().mean(0)
             phi0 = (phase[-1] + walk[-1])                     # непрерывность фаз
         return self.tm.read_intensity(acc / n_windows)
+
+
+EPS_ENCODE = 1e-12   # защита градиента d(sqrt)/dx = 1/(2 sqrt x) в нуле
+
+
+def encode_amplitude(values: torch.Tensor) -> torch.Tensor:
+    """
+    Значение -> амплитудное пропускание / амплитуда поля.
+    Реализация фикса оптиков: в оптику подаётся sqrt(значения), поэтому
+    детектор, меряющий квадрат, сразу читает значение без пост-обработки.
+    Требует неотрицательности (схема сдвигов её уже обеспечивает).
+    """
+    if (values < 0).any():
+        raise ValueError("sqrt-кодировка требует values >= 0 "
+                         "(используйте схему сдвигов в неотрицательный домен)")
+    return values.clamp_min(EPS_ENCODE).sqrt()
+
+
+def encode_intensity(values: torch.Tensor) -> torch.Tensor:
+    """
+    Значение -> интенсивность излучателя. Тождество: VCSEL кодирует значение
+    мощностью напрямую. Существует ради симметрии с encode_amplitude и
+    явности намерения в коде вызывающей стороны.
+    """
+    if (values < 0).any():
+        raise ValueError("интенсивностная кодировка требует values >= 0")
+    return values
+
+
+def decode_intensity(detected: torch.Tensor) -> torch.Tensor:
+    """
+    Показания детектора -> значения. Тождество: в некогерентной схеме с
+    sqrt-кодировкой пост-обработка корнем НЕ нужна (в отличие от когерентной
+    схемы, где стоял |E| -> ... -> sqrt). Функция существует, чтобы это
+    свойство было видно в коде, а не только в комментарии.
+    """
+    return detected
+
+
+class IncoherentMVM:
+    """
+    Готовый к употреблению некогерентный MVM с зашитой кодировкой.
+
+    Контракт: и веса, и вход, и выход — в домене ЗНАЧЕНИЙ. Кодировка
+    (sqrt на веса, интенсивность на вход, отсутствие корня на выходе)
+    выполняется внутри, ошибиться нельзя.
+
+        mvm = IncoherentMVM(mul, W)      # W — значения, не sqrt(W)
+        y   = mvm(x)                     # y ~ x @ W с точностью до калибр. скаляра
+
+    Скаляр c — физический коэффициент передачи тракта (потери, апертура),
+    в железе снимается калибровкой по реперным матрицам; здесь считается
+    один раз по единичному отклику и хранится в .gain.
+    """
+
+    def __init__(self, mul: OpticalMul, weights: torch.Tensor, chunk: int = 256,
+                 calibrate: bool = True):
+        self.tm = TransferMatrix(mul, encode_amplitude(weights), chunk=chunk)
+        self.pcm = PartialCoherentMul(self.tm)
+        self.weights = weights
+        self.gain = 1.0
+        if calibrate:
+            self.gain = self._calibrate()
+
+    @torch.no_grad()
+    def _calibrate(self) -> float:
+        """Коэффициент передачи по реперному входу (единичный вектор значений)."""
+        x = torch.ones(self.tm.vector_size)
+        y = self.pcm.incoherent(encode_intensity(x)).flatten()
+        y_ref = x @ self.weights
+        return ((y @ y_ref) / (y_ref @ y_ref)).item()
+
+    def __call__(self, values: torch.Tensor) -> torch.Tensor:
+        y = self.pcm.incoherent(encode_intensity(values))
+        return decode_intensity(y) / self.gain
 
 
 # ============================================================================

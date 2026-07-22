@@ -89,6 +89,7 @@ def draw_scheme(config: Config, spec: VCSELArraySpec,
     return out_path
 
 
-cfg = make_config(wavelength=850e-9)
-spec = VCSELArraySpec(n_emitters=16)
-print(draw_scheme(cfg, spec))
+if __name__ == "__main__":
+    cfg = make_config(wavelength=850e-9)
+    spec = VCSELArraySpec(n_emitters=16)
+    print(draw_scheme(cfg, spec))
