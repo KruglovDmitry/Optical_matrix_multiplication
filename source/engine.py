@@ -362,6 +362,9 @@ class OpticalEngine(nn.Module):
         # чтобы p · C · tile_size <= rows_per_call. 4096 строк ~ 6-12 ГБ
         # транзиента на апертуре 512; поднимайте при свободной памяти.
         self.rows_per_call = rows_per_call
+        # checkpointing вызовов в autograd-режиме (см. _mm); выключать только
+        # если памяти заведомо хватает и нужен amp-аудит
+        self.autograd_checkpoint = True
         self.gain = gain_inv
         # Шумовая модель устройства (OpticalNoiseModel или None — идеальный sim).
         self.noise = noise
@@ -438,8 +441,37 @@ class OpticalEngine(nn.Module):
         ffmap = (self._get_ff_map(a4.shape[-2], a4.shape[-1], b4.shape[-1],
                                   a4.device, torch.float32)
                  if self.flat_field else None)
+        if (self.backward == 'autograd' and torch.is_grad_enabled()
+                and (a4.requires_grad or b4.requires_grad)
+                and self.autograd_checkpoint):
+            # Checkpointing НА УРОВНЕ ВЫЗОВА: граф autograd сквозь пропагатор
+            # не помещается в память уже для одного слоя больших моделей
+            # (промежуточные поля каждого вызова сохраняются для backward).
+            # Сохраняем только входы, sim пересчитывается в backward с тем же
+            # RNG-состоянием (реализация шума реиграется). Цена: +1 forward.
+            # stats не собираем — пересчёт задвоил бы счётчики.
+            # Несовместимо с gain_drift (OU-состояние шагнёт повторно).
+            return torch.utils.checkpoint.checkpoint(
+                lambda a, b: optics_matmul(self.sim, a, b, gain=self.gain,
+                                           noise=self.noise, ffmap=ffmap),
+                a4, b4, use_reentrant=False)
         return optics_matmul(self.sim, a4, b4, gain=self.gain,
                              noise=self.noise, stats=stats, ffmap=ffmap)
+
+    def _mm_budget(self, a4, b4):
+        """Вызов _mm с гарантией бюджета строк-полей: если C*M_tile превышает
+        rows_per_call (внимание: C = batch*heads), режем по канальной оси.
+        Правый операнд с C=1 (веса) не режется — broadcast сохраняется."""
+        Ca, M = a4.shape[1], a4.shape[-2]
+        c_step = max(1, self.rows_per_call // max(1, M))
+        if Ca <= c_step:
+            return self._mm(a4, b4)
+        outs = []
+        for c0 in range(0, Ca, c_step):
+            sl = slice(c0, min(c0 + c_step, Ca))
+            b_sl = b4[:, sl] if b4.shape[1] == Ca else b4
+            outs.append(self._mm(a4[:, sl], b_sl))
+        return torch.cat(outs, dim=1)
 
     def _tiled_sequential(self, a4, b4):
         s = self.tile_size
@@ -451,8 +483,8 @@ class OpticalEngine(nn.Module):
             for j in range(0, N, s):
                 acc = None
                 for kk in range(0, K, s):
-                    p = self._mm(a4[..., i:i + s, kk:kk + s],
-                                 b4[..., kk:kk + s, j:j + s])
+                    p = self._mm_budget(a4[..., i:i + s, kk:kk + s],
+                                    b4[..., kk:kk + s, j:j + s])
                     acc = p if acc is None else acc + p
                 cols.append(acc)
             rows.append(torch.cat(cols, dim=-1))
@@ -492,7 +524,7 @@ class OpticalEngine(nn.Module):
                 sl = slice(p0, min(p0 + p_step, P))
                 left = At[ii[sl], kk]          # [p, Ca, s, s]
                 right = Bt[kk, jj[sl]]         # [p, Cb, s, s]
-                acc_k.append(self._mm(left, right))
+                acc_k.append(self._mm_budget(left, right))
             part = torch.cat(acc_k, dim=0)     # [P, C, s, s]
             out = part if out is None else out + part
         C = out.shape[1]
@@ -511,7 +543,7 @@ class OpticalEngine(nn.Module):
             a, b = a.float(), b.float()
         a4, b4 = self._to_4d(a), self._to_4d(b)
         if max(a4.shape[-2], a4.shape[-1], b4.shape[-1]) <= self.tile_size:
-            out4 = self._mm(a4, b4)
+            out4 = self._mm_budget(a4, b4)
         else:
             out4 = self._tiled_matmul(a4, b4)
         out = out4[0] if a.dim() == 3 else out4
