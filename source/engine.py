@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch.nn import init
 
 from source import OpticalMul, Config
+from source.incoherent import IncoherentConfig, IncoherentOpticalMul
 
 SIM_GAIN_INV = 1.0 / 3.44e-3
 
@@ -55,7 +56,11 @@ FORMULAS = {'shift': mm_shift, 'split': mm_split}
 class OpticalEngine(nn.Module):
     def __init__(self, size=512, pixel_size=3.6e-6, gain_inv=SIM_GAIN_INV,
                  splits=2, distance=0.15, lens_size=16384,
-                 formula='split', tile_size=None):
+                 formula='split', tile_size=None, physics='coherent',
+                 incoherent_config=None):
+        """physics='incoherent' — некогерентная схема в интенсивностях
+        (source/incoherent.py, геометрия из incoherent_config). Масштаб у неё
+        другой: при gain_inv=None он калибруется при первом вызове."""
         super().__init__()
         assert formula in FORMULAS, f"формула {formula} не из {list(FORMULAS)}"
         self.size = size
@@ -63,19 +68,28 @@ class OpticalEngine(nn.Module):
         self.gain = gain_inv
         self.formula_name = formula
         self.formula = FORMULAS[formula]
-        self.sim = OpticalMul(
-            Config(right_matrix_count_columns=size,
-                   right_matrix_count_rows=size,
-                   right_matrix_width=pixel_size * size,
-                   right_matrix_height=pixel_size * size,
-                   min_height_gap=pixel_size,
-                   right_matrix_split_x=splits,
-                   right_matrix_split_y=splits,
-                   left_matrix_split_x=splits,
-                   left_matrix_split_y=splits,
-                   result_matrix_split=splits,
-                   distance=distance,
-                   lens_size=lens_size))
+        self.physics = physics
+        if physics == 'incoherent':
+            cfg = incoherent_config or IncoherentConfig(
+                n_in=size, n_out=size, pitch_x=pixel_size, distance=distance,
+                lens_size=lens_size)
+            assert cfg.n_in == size and cfg.n_out == size, "поле установки = size"
+            self.sim = IncoherentOpticalMul(cfg)
+            self.gain = None if gain_inv is SIM_GAIN_INV else gain_inv
+        else:
+            self.sim = OpticalMul(
+                Config(right_matrix_count_columns=size,
+                       right_matrix_count_rows=size,
+                       right_matrix_width=pixel_size * size,
+                       right_matrix_height=pixel_size * size,
+                       min_height_gap=pixel_size,
+                       right_matrix_split_x=splits,
+                       right_matrix_split_y=splits,
+                       left_matrix_split_x=splits,
+                       left_matrix_split_y=splits,
+                       result_matrix_split=splits,
+                       distance=distance,
+                       lens_size=lens_size))
         # --- опциональная диагностика ---
         self._diag = collections.defaultdict(lambda: collections.defaultdict(float))
         self._diag_on = False
@@ -129,6 +143,8 @@ class OpticalEngine(nn.Module):
 
     def _call(self, a4, b4):
         """Один вызов выбранной формулы (тайл или целая матрица)."""
+        if self.gain is None:
+            self.calibrate_gain(n_trials=2, device=a4.device)
         return self.formula(self.sim, a4, b4, gain=self.gain)
 
     def _tiled(self, a4, b4):
