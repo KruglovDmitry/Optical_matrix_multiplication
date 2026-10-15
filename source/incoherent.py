@@ -221,24 +221,37 @@ class IncoherentOpticalMul(_nn.Module):
         kx = self._kx if crop is None else self._kx[:, crop[0], crop[1]]
         return _torch.einsum('...hs,lsm->l...hm', x, kx)
 
-    def row_response(self, other: _torch.Tensor, crop=None) -> _torch.Tensor:
-        """R[l, …, K, Nxm]: мощность на детекторе k от единичной засветки столбца xm."""
+    def row_response(self, other: _torch.Tensor, crop=None,
+                     max_elems: int = 2 ** 28) -> _torch.Tensor:
+        """
+        R[l, …, K, Nxm]: мощность на детекторе k от единичной засветки столбца xm.
+        Матрицы батча обрабатываются частями так, чтобы промежуточное поле на
+        детекторах занимало не больше max_elems комплексных чисел (по умолчанию 2 ГБ).
+        """
         c = self.config
         k = other.shape[-1]
-        t = other.float().clamp(0., 1.).clamp_min(1e-12).sqrt().transpose(-2, -1)  # (…, K, W)
-        t = _torch.kron(t.contiguous(), self._mask_lit).to(_torch.complex64)        # (…, Nym, Nxm)
         n_ys = c.src_samples_y
         g = self._g.unflatten(1, (n_ys, -1))                    # (L, Nys, Nyo, Nym)
         if crop is not None:
             g = g[:, :, crop[3], crop[2]]
         n_yo = g.shape[2]
+        batch = other.shape[:-2]
+        flat = other.reshape(-1, *other.shape[-2:])
+        n_xm = other.shape[-2] * c.split_x
+        step = max(1, max_elems // (n_ys * n_yo * n_xm))
         out = []
         for l in range(g.shape[0]):
-            a = g[l].reshape(-1, g.shape[-1]) @ t               # (…, Nys·Nyo, Nxm)
-            p = a.abs().square().unflatten(-2, (n_ys, n_yo)).sum(-3) / n_ys
-            p = p.unflatten(-2, (k, c.split_y))                 # (…, K, split_y, Nxm)
-            p = (p * self._det_lit[:, None]).sum(-2)
-            out.append(p.flip(-2))                              # изображение переворачивает строки
+            gl = g[l].reshape(-1, g.shape[-1])
+            parts = []
+            for i in range(0, flat.shape[0], step):
+                t = flat[i:i + step].float().clamp(0., 1.).clamp_min(1e-12).sqrt().transpose(-2, -1)
+                t = _torch.kron(t.contiguous(), self._mask_lit).to(_torch.complex64)  # (b, Nym, Nxm)
+                a = gl @ t                                      # (b, Nys·Nyo, Nxm)
+                p = a.abs().square().unflatten(-2, (n_ys, n_yo)).sum(-3) / n_ys
+                p = p.unflatten(-2, (k, c.split_y))             # (b, K, split_y, Nxm)
+                p = (p * self._det_lit[:, None]).sum(-2)
+                parts.append(p.flip(-2))                        # изображение переворачивает строки
+            out.append(_torch.cat(parts).reshape(*batch, k, n_xm))
         return _torch.stack(out)
 
     def response(self, other: _torch.Tensor) -> _torch.Tensor:
