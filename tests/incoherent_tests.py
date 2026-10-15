@@ -44,6 +44,16 @@ def test_smaller_matrix_centered():
     assert m(X, W).shape == (1, 1, 3, 2) and rel(m(X, W), X @ W) < 0.02
 
 
+def test_crop_equals_full_field():
+    """Расчёт на срезе совпадает с расчётом на всём поле с выключенными краями."""
+    m = small()
+    X, W = torch.rand(1, 1, 3, 5), torch.rand(1, 1, 5, 3)
+    Xf = torch.nn.functional.pad(X, (1, 2))
+    Wf = torch.nn.functional.pad(W, (1, 2, 1, 2))
+    full = m(Xf, Wf)[..., 1:4]
+    assert ((m(X, W) - full).norm() / full.norm()) < 1e-5
+
+
 def test_grid_warning():
     m = small(split=8)          # δ = 6,25 мкм > λ/(8NA) = 0,66 мкм
     with warnings.catch_warnings(record=True) as w:
