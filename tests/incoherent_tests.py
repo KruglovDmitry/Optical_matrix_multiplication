@@ -61,6 +61,18 @@ def test_grid_warning():
         assert not m.check_grid()['ok'] and w
 
 
+def test_source_spread_covers_field():
+    # Подточка светодиода 150 мкм светит только на ±0,18 мм, поле ±0,4 мм: края тёмные
+    m = small(split=4, n_out=16, src_samples_y=2)
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter('always')
+        assert not m.check_grid(warn=False)['ok']
+    assert m.illumination_profile()['rows'][0] < 0.1
+    n = IncoherentOpticalMul.min_src_samples(m.config)
+    rows = small(split=4, n_out=16, src_samples_y=n).illumination_profile()['rows']
+    assert (rows - 1).abs().max() < 0.05
+
+
 def test_engine_split():
     cfg = IncoherentConfig(n_in=8, n_out=8, pitch_x=50e-6, split_x=32, split_y=32,
                            src_height=300e-6, distance=0.1, lens_pixel_size=2e-6, lens_size=10000)

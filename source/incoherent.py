@@ -292,6 +292,12 @@ class IncoherentOpticalMul(_nn.Module):
         c = self.config
         return self(_torch.ones(1, 1, 1, c.n_in), _torch.ones(1, 1, c.n_in, c.n_out))[0, 0, 0]
 
+    @staticmethod
+    def min_src_samples(c: IncoherentConfig, margin: float = 1.2) -> int:
+        """Сколько точек по высоте светодиода нужно, чтобы растяжка покрыла все строки маски."""
+        lam = min(l for l, _ in c.spectrum)
+        return max(2, math.ceil(margin * c.src_height * c.n_out * c.pitch_y / (lam * c.distance)))
+
     def check_grid(self, warn: bool = True) -> dict:
         """Проверка численной сетки по правилам results/sim_limits (δ ≤ λ/8NA и т. д.)."""
         c = self.config
@@ -310,6 +316,17 @@ class IncoherentOpticalMul(_nn.Module):
         if c.lens_pixel_size > lp_max:
             msgs.append(f"шаг линзы {c.lens_pixel_size*1e6:.2f} мкм > {lp_max*1e6:.2f} мкм: "
                         f"край поля считается неверно")
+        # Растяжка по Y: каждая подточка светодиода шириной δs в sinc-базисе светит
+        # в угол ±λ/(2δs), то есть на маске освещена полоса ±λd/(2δs). Реальный
+        # светодиод почти ламбертов и светит гораздо шире, поэтому δs надо брать
+        # так, чтобы полоса покрывала всё поле, иначе крайние строки окажутся тёмными.
+        ds = c.src_height / c.src_samples_y
+        lit = lam * c.distance / (2 * ds)
+        res.update(src_delta=ds, src_lit_half=lit)
+        if lit < c.n_out * c.pitch_y / 2:
+            msgs.append(f"подточка светодиода {ds*1e6:.1f} мкм освещает только ±{lit*1e3:.2f} мм, "
+                        f"а поле ±{c.n_out*c.pitch_y/2e-3:.2f} мм: увеличь src_samples_y до "
+                        f"{self.min_src_samples(c)}")
         if field > c.aperture:
             msgs.append(f"поле {field*1e3:.2f} мм шире линзы {c.aperture*1e3:.2f} мм")
         if warn:
