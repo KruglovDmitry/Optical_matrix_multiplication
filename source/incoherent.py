@@ -158,6 +158,10 @@ class IncoherentOpticalMul(_nn.Module):
         yo = det.linspace_by_y.to(dbl)
         xl = lens.linspace_by_x.to(dbl)
         lp = c.lens_pixel_size
+        sx_, sy_ = c.split_x, c.split_y
+        lit_s = _lit(sx_, c.src_fill).to(dev)
+        lit_x, lit_y = _lit(sx_, c.mask_fill).to(dev), _lit(sy_, c.mask_fill).to(dev)
+        lit_d = _lit(sy_, c.det_fill).to(dev)
         Kx, G = [], []
         for lam, w in c.spectrum:
             opt = _ConfigOpticBase(lam, c.distance)
@@ -186,72 +190,69 @@ class IncoherentOpticalMul(_nn.Module):
                     l1y[:, None] * op(ys, src.pixel_size_by_y, l, lp))
                 hy2 += op(l, lp, yo, det.pixel_size_by_y) @ (
                     l3y[:, None] * op(ym, mask.pixel_size_by_y, l, lp))
-            Kx.append(w * hx1.abs().square().T.contiguous())       # (Nxs, Nxm)
+            # Внутри ячейки маски пропускание постоянно, поэтому подотсчёты сворачиваются
+            # заранее, без потери точности (как FastSim у когерентной схемы):
+            #  X: |поле|² в подотсчёте столбца = lit_x · |поле ячейки|², а светодиод светит
+            #     своей частью шага, так что засветка сводится к матрице n_in × n_in;
+            #  Y: поле на детекторе = Σ_i (Σ_sub G·lit_y) √W_i — оператор на ячейку строки.
+            # Интерференция строк (частичная когерентность по Y) остаётся точной.
+            kx = hx1.abs().square().T.reshape(c.n_in, sx_, c.n_in, sx_)
+            Kx.append(w * _torch.einsum('asbt,s,t->ab', kx, lit_s, lit_x))      # (n_in, n_in)
             # G[ys] = hy2 · diag(hy1[:, ys]): поле на детекторе от одной точки светодиода
             g = hy2[None, :, :] * hy1.T[:, None, :]                 # (Nys, Nyo, Nym)
-            G.append(g.reshape(-1, g.shape[-1]))
-        self.register_buffer('_kx', _torch.stack(Kx), persistent=False)    # (L, Nxs, Nxm)
-        self.register_buffer('_g', _torch.stack(G), persistent=False)      # (L, Nys·Nyo, Nym)
-        self.register_buffer('_src_lit', _lit(c.split_x, c.src_fill).to(dev), persistent=False)
-        mm = _torch.outer(_lit(c.split_y, c.mask_fill), _lit(c.split_x, c.mask_fill))
-        self.register_buffer('_mask_lit', mm.to(dev), persistent=False)
-        self.register_buffer('_det_lit', _lit(c.split_y, c.det_fill).to(dev), persistent=False)
+            g = (g.unflatten(-1, (c.n_out, sy_)) * lit_y).sum(-1)   # (Nys, Nyo, n_out)
+            g = g.unflatten(1, (c.n_out, sy_))[:, :, lit_d > 0]     # только площадь детектора
+            G.append(g)                                             # (Nys, n_out, nd, n_out)
+            del hx1, hy1, hy2
+        self.register_buffer('_kc', _torch.stack(Kx), persistent=False)    # (L, n_in, n_in)
+        self.register_buffer('_gc', _torch.stack(G), persistent=False)     # (L, Nys, n_out, nd, n_out)
 
     # --- этапы схемы ---------------------------------------------------------
     def _crop(self, w: int, k: int):
         """
-        Срезы буферов под матрицу w×k в центре поля. Вне неё светодиоды выключены,
+        Срезы (в элементах) под матрицу w×k в центре поля. Вне неё светодиоды выключены,
         а ячейки маски закрыты, поэтому туда не приходит и оттуда не уходит свет:
-        срез даёт тот же результат, что и расчёт на полном поле, но стоит
-        пропорционально размеру матрицы, а не поля.
+        срез даёт тот же результат, что и расчёт на полном поле.
         """
         c = self.config
-        sx, sy = c.split_x, c.split_y
         pw, pk = (c.n_in - w) // 2, (c.n_out - k) // 2
-        xm = slice(pw * sx, (pw + w) * sx)                                  # столбцы маски
-        xs = slice((c.n_in - pw - w) * sx, (c.n_in - pw) * sx)              # светодиоды (перевёрнуты)
-        ym = slice(pk * sy, (pk + k) * sy)                                  # строки маски
-        yo = slice((c.n_out - pk - k) * sy, (c.n_out - pk) * sy)            # детекторы (перевёрнуты)
+        xm = slice(pw, pw + w)                              # столбцы маски
+        xs = slice(c.n_in - pw - w, c.n_in - pw)            # светодиоды (изображение переворачивает)
+        ym = slice(pk, pk + k)                              # строки маски
+        yo = slice(c.n_out - pk - k, c.n_out - pk)          # детекторы (перевёрнуты)
         return xs, xm, ym, yo
 
     def illuminate(self, input: _torch.Tensor, crop=None) -> _torch.Tensor:
-        """Интенсивность на столбцах маски по X: (…, H, Nxm) для каждой λ -> (L, …, H, Nxm)."""
+        """Свет, прошедший через открытую часть каждого столбца маски: (…, H, w) -> (L, …, H, w)."""
         x = input.float().flip(-1)                          # изображение 2f–2f переворачивает
-        x = _torch.kron(x.contiguous(), self._src_lit[None, :])
-        kx = self._kx if crop is None else self._kx[:, crop[0], crop[1]]
-        return _torch.einsum('...hs,lsm->l...hm', x, kx)
+        kc = self._kc if crop is None else self._kc[:, crop[0], crop[1]]
+        return _torch.einsum('...hs,lsm->l...hm', x, kc)
 
     def row_response(self, other: _torch.Tensor, crop=None,
                      max_elems: int = 2 ** 28) -> _torch.Tensor:
         """
-        R[l, …, K, Nxm]: мощность на детекторе k от единичной засветки столбца xm.
-        Матрицы батча обрабатываются частями так, чтобы промежуточное поле на
-        детекторах занимало не больше max_elems комплексных чисел (по умолчанию 2 ГБ).
+        R[l, …, K, w]: мощность на детекторе k на единицу света в столбце c маски.
+        Матрицы батча обрабатываются частями так, чтобы поле на детекторах занимало
+        не больше max_elems комплексных чисел.
         """
-        c = self.config
-        k = other.shape[-1]
-        n_ys = c.src_samples_y
-        g = self._g.unflatten(1, (n_ys, -1))                    # (L, Nys, Nyo, Nym)
-        if crop is not None:
-            g = g[:, :, crop[3], crop[2]]
-        n_yo = g.shape[2]
+        k, w = other.shape[-1], other.shape[-2]
+        g = self._gc if crop is None else self._gc[:, :, crop[3], :, crop[2]]
+        n_ys, n_d = g.shape[1], g.shape[3]
         batch = other.shape[:-2]
-        flat = other.reshape(-1, *other.shape[-2:])
-        n_xm = other.shape[-2] * c.split_x
-        step = max(1, max_elems // (n_ys * n_yo * n_xm))
+        flat = other.reshape(-1, w, k)
+        step = max(1, max_elems // (n_ys * k * n_d * w))
         out = []
         for l in range(g.shape[0]):
-            gl = g[l].reshape(-1, g.shape[-1])
+            gl = g[l].reshape(-1, k)                            # (Nys·K·nd, K)
             parts = []
             for i in range(0, flat.shape[0], step):
-                t = flat[i:i + step].float().clamp(0., 1.).clamp_min(1e-12).sqrt().transpose(-2, -1)
-                t = _torch.kron(t.contiguous(), self._mask_lit).to(_torch.complex64)  # (b, Nym, Nxm)
-                a = gl @ t                                      # (b, Nys·Nyo, Nxm)
-                p = a.abs().square().unflatten(-2, (n_ys, n_yo)).sum(-3) / n_ys
-                p = p.unflatten(-2, (k, c.split_y))             # (b, K, split_y, Nxm)
-                p = (p * self._det_lit[:, None]).sum(-2)
+                t = flat[i:i + step].float().clamp(0., 1.).clamp_min(1e-12).sqrt()
+                t = t.transpose(-2, -1).to(_torch.complex64)    # (b, K, w): √W по строкам маски
+                a = gl @ t                                      # (b, Nys·K·nd, w)
+                p = a.real.square() + a.imag.square()
+                p = p.unflatten(-2, (n_ys, k, n_d)).sum((-4, -2)) / n_ys
                 parts.append(p.flip(-2))                        # изображение переворачивает строки
-            out.append(_torch.cat(parts).reshape(*batch, k, n_xm))
+            out.append(_torch.cat(parts).reshape(*batch, k, w))
         return _torch.stack(out)
 
     def response(self, other: _torch.Tensor) -> _torch.Tensor:
@@ -265,7 +266,7 @@ class IncoherentOpticalMul(_nn.Module):
         assert w <= c.n_in and k <= c.n_out, "матрица больше поля установки"
         # Меньшая матрица стоит в центре поля (как центрирование в OpticalMul).
         crop = self._crop(w, k)
-        ix = self.illuminate(input, crop)                       # (L, …, H, w·sx)
+        ix = self.illuminate(input, crop)                       # (L, …, H, w)
         r = self.row_response(other, crop) if response is None else response
         return (ix @ r.transpose(-2, -1)).sum(0)
 
@@ -280,7 +281,6 @@ class IncoherentOpticalMul(_nn.Module):
         c = self.config
         ones_x = _torch.ones(1, c.n_in)
         cols = self.illuminate(ones_x).sum(0)[0]
-        cols = cols.unflatten(-1, (c.n_in, c.split_x)).sum(-1)
         r = self.row_response(_torch.ones(c.n_in, c.n_out)).sum(0)   # (K, Nxm)
         rows = r.sum(-1)
         norm = lambda v: v / v[len(v) // 2]
