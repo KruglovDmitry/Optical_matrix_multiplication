@@ -66,12 +66,17 @@ class IncoherentConfig:
         src_fill:       доля шага pitch_x, которая светится у светодиода.
         src_height:     высота светящейся области светодиода по Y.
         src_samples_y:  число некогерентных точек по высоте светодиода.
-        mask_fill:      открытая доля ячейки маски по каждой оси (зазор между ячейками).
+        mask_fill:      открытая доля ячейки маски по каждой оси (зазор между ячейками);
+                        пара (по X, по Y), если доли разные (например, субпиксель цветного ЖК).
         det_fill:       доля шага pitch_y, которую занимает фотодетектор.
         wavelength:     длина волны (центральная).
-        spectrum:       [(λ, вес), ...] для широкополосного светодиода; None — одна λ.
+        spectrum:       [(λ, вес), ...] для широкополосного светодиода; None — одна λ
+                        (led_spectrum() строит гауссов спектр по центру и ширине).
         distance:       d, расстояние между плоскостями (f = d у Фурье-линз, d/2 у изображающих).
         lens_pixel_size, lens_size: сетка линз; апертура D = lens_size·lens_pixel_size.
+        lens_glass:     None — линзы идеальные ахроматы (фокус не зависит от λ);
+                        имя стекла из GLASS (например 'N-BK7') — одиночные линзы,
+                        фокус f(λ) = f₀·(n(λ₀) − 1)/(n(λ) − 1), где f₀ задан на λ₀ = wavelength.
     """
 
     def __init__(self, n_in: int, n_out: int, pitch_x: float,
@@ -83,7 +88,8 @@ class IncoherentConfig:
                  wavelength: float = 532e-9,
                  spectrum: Optional[Sequence[Tuple[float, float]]] = None,
                  distance: float = 0.1,
-                 lens_pixel_size: float = 1.8e-6, lens_size: int = 8192):
+                 lens_pixel_size: float = 1.8e-6, lens_size: int = 8192,
+                 lens_glass: Optional[str] = None):
         self.n_in, self.n_out = n_in, n_out
         self.pitch_x = pitch_x
         self.pitch_y = pitch_x if pitch_y is None else pitch_y
@@ -92,10 +98,24 @@ class IncoherentConfig:
         self.src_height = self.pitch_y if src_height is None else src_height
         self.src_samples_y = src_samples_y
         self.mask_fill, self.det_fill = mask_fill, det_fill
+        assert lens_glass is None or lens_glass in GLASS, f"неизвестное стекло {lens_glass}"
+        self.lens_glass = lens_glass
         self.wavelength = wavelength
         self.spectrum = list(spectrum) if spectrum else [(wavelength, 1.0)]
         self.distance = distance
         self.lens_pixel_size, self.lens_size = lens_pixel_size, lens_size
+
+    @property
+    def mask_fill_xy(self) -> Tuple[float, float]:
+        f = self.mask_fill
+        return (f, f) if isinstance(f, (int, float)) else (float(f[0]), float(f[1]))
+
+    def lens_power(self, lam: float) -> float:
+        """Оптическая сила линз на λ относительно λ₀ = wavelength (1 у идеального ахромата)."""
+        if self.lens_glass is None:
+            return 1.0
+        n = GLASS[self.lens_glass]
+        return (n(lam) - 1) / (n(self.wavelength) - 1)
 
     @property
     def aperture(self) -> float:
@@ -116,6 +136,36 @@ class IncoherentConfig:
         det = _Plane((self.n_out * self.split_y, 1),
                      aperture=(self.n_out * self.pitch_y, self.pitch_x))
         return src, lens, mask, det
+
+
+def _sellmeier(B, C):
+    """Показатель преломления по формуле Селлмейера, λ в метрах (коэффициенты для мкм)."""
+    def n(lam):
+        l2 = (lam * 1e6) ** 2
+        return math.sqrt(1 + sum(b * l2 / (l2 - c) for b, c in zip(B, C)))
+    return n
+
+
+# Каталожные коэффициенты Schott.
+GLASS = {
+    'N-BK7': _sellmeier((1.03961212, 0.231792344, 1.01046945),
+                        (0.00600069867, 0.0200179144, 103.560653)),
+    'N-SF11': _sellmeier((1.73759695, 0.313747346, 1.89878101),
+                         (0.013188707, 0.0623068142, 155.23629)),
+}
+
+
+def led_spectrum(center: float, fwhm: float, n: int = 5, span: float = 2.0):
+    """
+    Гауссов спектр светодиода: n длин волн в пределах ±span·σ от центра, веса нормированы на 1.
+    Зелёный InGaN — около 525 нм и 30–40 нм ширины, янтарный AlInGaP — 590 нм и ~15 нм.
+    """
+    if n <= 1 or fwhm <= 0:
+        return [(center, 1.0)]
+    sigma = fwhm / (2 * math.sqrt(2 * math.log(2)))
+    lams = [center + span * sigma * (2 * i / (n - 1) - 1) for i in range(n)]
+    w = [math.exp(-0.5 * ((l - center) / sigma) ** 2) for l in lams]
+    return [(l, v / sum(w)) for l, v in zip(lams, w)]
 
 
 def _sinc_op(difference, pixel_in, pixel_out, opt):
@@ -160,12 +210,14 @@ class IncoherentOpticalMul(_nn.Module):
         lp = c.lens_pixel_size
         sx_, sy_ = c.split_x, c.split_y
         lit_s = _lit(sx_, c.src_fill).to(dev)
-        lit_x, lit_y = _lit(sx_, c.mask_fill).to(dev), _lit(sy_, c.mask_fill).to(dev)
+        fx, fy = c.mask_fill_xy
+        lit_x, lit_y = _lit(sx_, fx).to(dev), _lit(sy_, fy).to(dev)
         lit_d = _lit(sy_, c.det_fill).to(dev)
         Kx, G = [], []
-        for lam, w in c.spectrum:
+        for lam, wt in c.spectrum:
             opt = _ConfigOpticBase(lam, c.distance)
             k = opt.K
+            pw = c.lens_power(lam)       # хроматизм одиночной линзы: f(λ) = f₀ / pw
 
             def op(x_in, pin, x_out, pout):
                 """Оператор sinc-базиса (out, in) — та же формула, что в PropagatorSinc."""
@@ -179,8 +231,8 @@ class IncoherentOpticalMul(_nn.Module):
                 # Фазы скрещенных линз — те же, что в PropagatorCrossLens:
                 # L1: X -> exp(-ik x²/d) (изображение), Y -> exp(-ik y²/2d) (Фурье);
                 # L3 (транспонированная): Y -> exp(-ik y²/d) (изображение).
-                l1x = _torch.exp(-1j * k / c.distance * l ** 2).to(dev, _torch.complex64)
-                l1y = _torch.exp(-1j * k / 2 / c.distance * l ** 2).to(dev, _torch.complex64)
+                l1x = _torch.exp(-1j * pw * k / c.distance * l ** 2).to(dev, _torch.complex64)
+                l1y = _torch.exp(-1j * pw * k / 2 / c.distance * l ** 2).to(dev, _torch.complex64)
                 l3y = l1x
                 # X: источник -> маска. Фаза полевой линзы у маски на |·|² не влияет.
                 hx1 += op(l, lp, xm, mask.pixel_size_by_x) @ (
@@ -197,7 +249,7 @@ class IncoherentOpticalMul(_nn.Module):
             #  Y: поле на детекторе = Σ_i (Σ_sub G·lit_y) √W_i — оператор на ячейку строки.
             # Интерференция строк (частичная когерентность по Y) остаётся точной.
             kx = hx1.abs().square().T.reshape(c.n_in, sx_, c.n_in, sx_)
-            Kx.append(w * _torch.einsum('asbt,s,t->ab', kx, lit_s, lit_x))      # (n_in, n_in)
+            Kx.append(wt * _torch.einsum('asbt,s,t->ab', kx, lit_s, lit_x))      # (n_in, n_in)
             # G[ys] = hy2 · diag(hy1[:, ys]): поле на детекторе от одной точки светодиода
             g = hy2[None, :, :] * hy1.T[:, None, :]                 # (Nys, Nyo, Nym)
             g = (g.unflatten(-1, (c.n_out, sy_)) * lit_y).sum(-1)   # (Nys, Nyo, n_out)
